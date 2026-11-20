@@ -101,16 +101,47 @@ class ESRGAN4x(nn.Module):
         return self.model(x)
 
 
-def load_model(weights_path: Path, device: torch.device) -> nn.Module:
+class SRVGGNetCompact(nn.Module):
+    """Real-ESRGAN v3 Compact (realesr-general-x4v3.pth): fast, sharp 4x upscaler."""
+
+    def __init__(self, num_in_ch: int = 3, num_out_ch: int = 3, num_feat: int = 64, num_conv: int = 32, upscale: int = 4) -> None:
+        super().__init__()
+        self.upscale = upscale
+        self.body = nn.ModuleList()
+        self.body.append(nn.Conv2d(num_in_ch, num_feat, 3, 1, 1))
+        self.body.append(nn.PReLU(num_parameters=num_feat))
+        for _ in range(num_conv):
+            self.body.append(nn.Conv2d(num_feat, num_feat, 3, 1, 1))
+            self.body.append(nn.PReLU(num_parameters=num_feat))
+        self.body.append(nn.Conv2d(num_feat, num_out_ch * upscale * upscale, 3, 1, 1))
+        self.upsampler = nn.PixelShuffle(upscale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x
+        for layer in self.body:
+            out = layer(out)
+        out = self.upsampler(out)
+        base = F.interpolate(x, scale_factor=self.upscale, mode="nearest")
+        return out + base
+
+
+def load_model(weights_path: Path, device: torch.device, fp16: bool = False) -> nn.Module:
     sd = torch.load(weights_path, map_location="cpu", weights_only=True)
     if "params_ema" in sd:
         sd = sd["params_ema"]
     elif "params" in sd:
         sd = sd["params"]
-    model = ESRGAN4x()
+    if "body.0.weight" in sd:
+        num_feat = sd["body.0.weight"].shape[0]
+        # Count conv+prelu pairs between body.0..body.last
+        max_idx = max(int(k.split(".")[1]) for k in sd if k.startswith("body."))
+        num_conv = (max_idx - 2) // 2
+        model: nn.Module = SRVGGNetCompact(num_feat=num_feat, num_conv=num_conv, upscale=4)
+    else:
+        model = ESRGAN4x()
     model.load_state_dict(sd, strict=True)
     model.eval().to(device)
-    if device.type == "cuda":
+    if fp16 and device.type == "cuda":
         model.half()
     return model
 
@@ -243,7 +274,7 @@ def collect_packages(retail_dir: Path, lang: str) -> list[tuple[Path, str]]:
                 continue
             if not low.endswith(".utx"):
                 continue
-            if low in ("uwindowfonts.utx", "hpedit.utx", "palettes.utx"):
+            if low in ("uwindowfonts.utx", "hpedit.utx", "palettes.utx", "aoldemo_hp2.utx"):
                 continue
             if low == "menuart.utx":
                 continue  # handled below so localized MenuArt takes precedence
@@ -307,7 +338,7 @@ def extract_all_textures(retail_dir: Path, lang: str) -> list[dict]:
             parts = raw_path.split(".")
             parts[0] = pkg_name
             full_key = ".".join(parts).lower()
-            if full_key in seen_keys:
+            if "inkfont" in full_key or full_key in seen_keys:
                 continue
             seen_keys.add(full_key)
 
@@ -339,6 +370,7 @@ def upscale_batch(
     batch_items: list[dict],
     max_dim: int,
     out_dir: Path,
+    fp16: bool = False,
 ) -> int:
     """Upscale a batch of same-size textures with padding and save PNGs."""
     # Group inside by (tileable) so padding is uniform
@@ -367,9 +399,14 @@ def upscale_batch(
             tensors.append(t)
 
         inp = torch.stack(tensors, dim=0).to(device, non_blocking=True)
-        if device.type == "cuda":
+        if fp16 and device.type == "cuda":
             inp = inp.half()
-        out = model(inp).float().clamp_(0.0, 1.0)
+        out = model(inp).float()
+        if not torch.isfinite(out).all():
+            raise RuntimeError(
+                "Upscaler produced NaN/Inf values (re-run without --fp16 on Turing/GTX 16xx GPUs)"
+            )
+        out = out.clamp_(0.0, 1.0)
         # Crop 4x pad
         p4 = pad * 4
         out = out[:, :, p4 : p4 + h * 4, p4 : p4 + w * 4]
@@ -408,23 +445,24 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--lang", default="pol")
     parser.add_argument("--max-dim", type=int, default=1024)
+    parser.add_argument("--fp16", action="store_true", help="Use FP16 inference (Ampere+ GPUs; avoid on GTX 16xx)")
     args = parser.parse_args()
 
     args.output.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    print(f"Extracting textures from {args.retail_dir} (lang={args.lang})...")
+    print(f"Extracting textures from {args.retail_dir} (lang={args.lang})...", flush=True)
     items = extract_all_textures(args.retail_dir, args.lang.lower())
-    print(f"Found {len(items)} unique P8 textures in {time.time() - t0:.1f}s")
+    print(f"Found {len(items)} unique P8 textures in {time.time() - t0:.1f}s", flush=True)
 
     # Skip already-generated files so re-runs resume cleanly
     todo = [it for it in items if not (args.output / f"{it['key']}.png").exists()]
-    print(f"Upscaling {len(todo)} textures (skipping {len(items) - len(todo)} existing)...")
+    print(f"Upscaling {len(todo)} textures (skipping {len(items) - len(todo)} existing)...", flush=True)
     if not todo:
         return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Loading {args.model.name} on {device}...")
-    model = load_model(args.model, device)
+    print(f"Loading {args.model.name} on {device} (fp16={args.fp16})...", flush=True)
+    model = load_model(args.model, device, fp16=args.fp16)
 
     # Group by (w, h) for efficient CUDA batching without OOM on 6 GB VRAM
     buckets: dict[tuple[int, int], list[dict]] = defaultdict(list)
@@ -432,27 +470,36 @@ def main() -> None:
         buckets[(it["w"], it["h"])].append(it)
 
     done = 0
+    last_milestone = 0
     t_start = time.time()
+    is_compact = isinstance(model, SRVGGNetCompact)
     for (w, h), group in sorted(buckets.items(), key=lambda kv: kv[0][0] * kv[0][1]):
-        # Pick safe batch size for 6 GB VRAM (256x256 padded 288x288 -> 1152x1152 needs ~1.2GB/img)
         pixels = (w + 32) * (h + 32)
-        if pixels <= 64 * 64:
-            bs = 16
-        elif pixels <= 144 * 144:
-            bs = 8
-        elif pixels <= 200 * 200:
-            bs = 4
+        if is_compact:
+            if pixels <= 80 * 80:
+                bs = 32
+            elif pixels <= 160 * 160:
+                bs = 12
+            else:
+                bs = 4
         else:
-            bs = 2
+            if pixels <= 64 * 64:
+                bs = 16
+            elif pixels <= 144 * 144:
+                bs = 6
+            else:
+                bs = 2
         for i in range(0, len(group), bs):
-            done += upscale_batch(model, device, group[i : i + bs], args.max_dim, args.output)
-            if done % 100 == 0 or done == len(todo):
+            done += upscale_batch(model, device, group[i : i + bs], args.max_dim, args.output, fp16=args.fp16)
+            milestone = done // 100
+            if milestone > last_milestone or done == len(todo):
+                last_milestone = milestone
                 elapsed = time.time() - t_start
                 rate = done / max(elapsed, 0.1)
                 eta = (len(todo) - done) / max(rate, 0.01)
                 print(f"  [{done}/{len(todo)}] {rate:.1f} tex/s (ETA {eta:.0f}s) last={w}x{h}", flush=True)
 
-    print(f"Done! {done} HD textures saved to {args.output} in {time.time() - t_start:.1f}s")
+    print(f"Done! {done} HD textures saved to {args.output} in {time.time() - t_start:.1f}s", flush=True)
 
 
 if __name__ == "__main__":
