@@ -1301,6 +1301,16 @@ pub unsafe fn update_input_with<B: UpdateInputBackend>(
             }
         }
         let context = backend.context()?;
+        if !verification && game_controller::active() && event.kind == sdl_event::CONTROLLERAXISMOTION {
+            // Live controller axes are sampled once per tick below so held
+            // sticks drive gameplay continuously (UE1 zeroes float axes every
+            // tick) without high-polling-rate event spikes.
+            if (event.joy_axis as i32) <= game_controller::axis::LEFT_Y {
+                let mut pointer = MENU_POINTER.lock().expect("menu pointer lock poisoned");
+                pointer.stick[event.joy_axis as usize] = (event.joy_axis_value as f32 / 32767.0).clamp(-1.0, 1.0);
+            }
+            continue;
+        }
         let actions = {
             let mut pointer = MENU_POINTER.lock().expect("menu pointer lock poisoned");
             translate_event_inner(&context, &event, verification, Some(&mut pointer), game_controller::menu_mode())
@@ -1309,18 +1319,44 @@ pub unsafe fn update_input_with<B: UpdateInputBackend>(
     }
     if !verification {
         let context = backend.context()?;
-        let action = {
+        let (menu_action, dt) = {
             let mut pointer = MENU_POINTER.lock().expect("menu pointer lock poisoned");
             let now = std::time::Instant::now();
             let dt = pointer.last_step.replace(now).map_or(0.0, |last| now.duration_since(last).as_secs_f32().min(0.1));
-            if game_controller::active() && game_controller::menu_mode() && context.has_engine && !context.mouse_is_grabbed {
+            let action = if game_controller::active() && game_controller::menu_mode() && context.has_engine && !context.mouse_is_grabbed {
+                if let Some(raw_axes) = game_controller::read_axes() {
+                    pointer.stick[0] = (raw_axes[0] as f32 / 32767.0).clamp(-1.0, 1.0);
+                    pointer.stick[1] = (raw_axes[1] as f32 / 32767.0).clamp(-1.0, 1.0);
+                }
                 pointer.step(&context, dt)
             } else {
                 None
-            }
+            };
+            (action, dt)
         };
-        if let Some(action) = action {
+        if let Some(action) = menu_action {
             backend.execute_action(action)?;
+        }
+        if game_controller::active() {
+            if game_controller::menu_mode() {
+                for (key, action, delta) in game_controller::release_held_triggers().iter() {
+                    backend.cause_input(key, action, delta)?;
+                }
+            } else if dt > 0.0 {
+                if let Some(raw_axes) = game_controller::read_axes() {
+                    let events = game_controller::map_gameplay_axes(
+                        raw_axes,
+                        dt,
+                        context.joystick_dead_zone,
+                        context.scale_jbx,
+                        context.scale_jby,
+                        input_options::gamepad_look_sensitivity(),
+                    );
+                    for (key, action, delta) in events.iter() {
+                        backend.cause_input(key, action, delta)?;
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -1332,6 +1368,7 @@ pub unsafe fn update_input_with<B: UpdateInputBackend>(
 pub(crate) fn release_controller_inputs<B: UpdateInputBackend>(
     backend: &mut B,
 ) -> Result<(), B::Error> {
+    game_controller::reset_triggers();
     for key in game_controller::AXIS_KEYS {
         backend.cause_input(key, ist::AXIS, 0.0)?;
     }
@@ -1355,6 +1392,7 @@ pub(crate) fn release_controller_inputs<B: UpdateInputBackend>(
 #[cfg(feature = "sdl")]
 pub(crate) fn release_all_with<B: UpdateInputBackend>(backend: &mut B) -> Result<(), B::Error> {
     backend.before_release_all()?;
+    game_controller::reset_triggers();
     let mut cursor = release_all_begin(backend.has_input()?);
     let mut held = false;
     while let Some(step) = release_all_next(&mut cursor, held) {

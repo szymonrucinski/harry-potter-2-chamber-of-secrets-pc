@@ -84,6 +84,91 @@ pub(crate) unsafe fn static_init_input(access: CoreAccess<'_>) -> RuntimeResult<
         access.link_cpp_struct(class.cast())?;
         let defaults = access.default_object(class)?;
         access.load_config(defaults)?;
+        apply_default_gamepad_bindings(access, defaults.cast::<UInput>(), input_keys)?;
+    }
+    Ok(())
+}
+
+/// Default gameplay bindings for SDL GameController buttons when retail
+/// `DefUser.ini`/`User.ini` leaves all `Joy1`..`Joy16` and `JoyPov*` empty.
+/// Never overrides existing bindings if the player bound any gamepad button.
+const DEFAULT_GAMEPAD_BUTTON_BINDINGS: &[(&str, &str)] = &[
+    // X / Square: Cast spell / interact / broom / vendor (matches LeftMouse).
+    ("Joy1", "AltFire | Button bBroomAction | Button bVendorReply"),
+    // A / Cross: Jump / broom / skip cutscene.
+    ("Joy2", "Jump | Button bBroomAction | Button bSkipCutScene"),
+    // B / Circle: Cycle duel spell / skip cutscene.
+    ("Joy3", "Button bDuelCycleSpell | Button bSkipCutScene"),
+    // Y / Triangle: Drink Wiggenwell potion (matches Q).
+    ("Joy4", "Button bDrinkWiggenwell"),
+    // LB / L1 & RB / R1: Strafe left/right & broom yaw.
+    ("Joy5", "StrafeLeft | Button bBroomYawLeft"),
+    ("Joy6", "StrafeRight | Button bBroomYawRight"),
+    // Back / Share: Open Marauder's Map / Folio (matches Tab).
+    ("Joy7", "button bOpenMap"),
+    // L3 / R3: Walk modifier & center camera.
+    ("Joy9", "Walking"),
+    ("Joy10", "CenterView"),
+    // LT / L2: Hold to strafe / center camera.
+    ("Joy11", "Strafe | CenterView"),
+    // RT / R2: Cast spell / interact (matches LeftMouse).
+    ("Joy12", "AltFire | Button bBroomAction | Button bVendorReply"),
+    // D-pad: Spell lessons, broom control, and quick duel spells / potion.
+    ("JoyPovUp", "Button bSpellLessonUp | Button bBroomPitchUp | Button bDuelMimblewimble"),
+    ("JoyPovDown", "Button bSpellLessonDown | Button bBroomPitchDown | Button bDrinkWiggenwell"),
+    ("JoyPovLeft", "Button bSpellLessonLeft | Button bBroomYawLeft | Button bDuelRictusempra"),
+    ("JoyPovRight", "Button bSpellLessonRight | Button bBroomYawRight | Button bDuelExpelliarmus"),
+];
+
+fn is_gamepad_button_key(suffix: &[u32]) -> bool {
+    const BUTTON_KEYS: &[&[u8]] = &[
+        b"Joy1", b"Joy2", b"Joy3", b"Joy4", b"Joy5", b"Joy6", b"Joy7", b"Joy8",
+        b"Joy9", b"Joy10", b"Joy11", b"Joy12", b"Joy13", b"Joy14", b"Joy15", b"Joy16",
+        b"JoyPovUp", b"JoyPovDown", b"JoyPovLeft", b"JoyPovRight",
+    ];
+    BUTTON_KEYS.iter().any(|key| eq_ascii_case(suffix, key))
+}
+
+unsafe fn apply_default_gamepad_bindings(
+    access: CoreAccess<'_>,
+    defaults: *mut UInput,
+    input_keys: *mut UEnum,
+) -> RuntimeResult<()> {
+    if defaults.is_null() || input_keys.is_null() {
+        return Ok(());
+    }
+    let names = unsafe { ptr::addr_of!((*input_keys).names).read_unaligned() };
+    if names.num <= 0 || names.max < names.num || names.data.is_null() {
+        return Ok(());
+    }
+    let limit = names.num.min(255) as usize;
+    let mut matches: Vec<(usize, &str)> = Vec::new();
+    for index in 0..limit {
+        let key = unsafe { names.data.cast::<FName>().add(index).read_unaligned() };
+        if key.index == 0 {
+            continue;
+        }
+        let text = access.name_text(key.index)?;
+        let Some(suffix) = text.get(3..) else { continue; };
+        if is_gamepad_button_key(suffix) {
+            let binding = unsafe { ptr::addr_of!((*defaults).bindings[index]).read_unaligned() };
+            if binding.num > 1 {
+                // Player or INI already defines at least one gamepad button; keep untouched.
+                return Ok(());
+            }
+            if let Some(&(_, command)) = DEFAULT_GAMEPAD_BUTTON_BINDINGS
+                .iter()
+                .find(|&&(name, _)| eq_ascii_case(suffix, name.as_bytes()))
+            {
+                matches.push((index, command));
+            }
+        }
+    }
+    for (index, command) in matches {
+        let wide: Vec<u32> = command.chars().map(u32::from).chain([0]).collect();
+        unsafe {
+            access.assign_fstring(&raw mut (*defaults).bindings[index], &wide)?;
+        }
     }
     Ok(())
 }

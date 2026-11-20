@@ -463,8 +463,12 @@ pub unsafe fn init_client(
             unsafe { (*client).use_joystick = 0; }
         }
         // A recognized gamepad at the selected index also opens as an SDL game
-        // controller; its events then replace the raw joystick layout.
-        hp2_platform::game_controller::open_configured(unsafe { (*client).joystick_number });
+        // controller; its events then replace the raw joystick layout. Fall
+        // back to the first recognized controller when index `joystick_number`
+        // is occupied by a non-gamepad HID device.
+        if !hp2_platform::game_controller::open_configured(unsafe { (*client).joystick_number }) {
+            hp2_platform::game_controller::open_first_available();
+        }
     }
     Ok(())
 }

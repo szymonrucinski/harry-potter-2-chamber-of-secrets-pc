@@ -10,10 +10,10 @@
 //!
 //! | Controller input | UE1 key |
 //! |---|---|
-//! | left stick X / Y | `JoyX` / `JoyY` (scaled by `ScaleJBX`/`ScaleJBY`) |
-//! | right stick X / Y | `JoyU` / `JoyV` (times `GamepadLookSensitivity`) |
+//! | left stick X / Y | `JoyX` / `JoyY` (polled per tick, Y inverted to UE forward, scaled by `ScaleJBX`/`ScaleJBY`) |
+//! | right stick X / Y | `MouseX` / `MouseY` in gameplay (polled per tick, times `GamepadLookSensitivity`), `JoyU` / `JoyV` in raw event translator |
 //! | left / right trigger | `JoyZ` / `JoyR` axes, and `Joy11` / `Joy12` past half pull |
-//! | X, A, B, Y | `Joy1` (Fire), `Joy2` (Jump), `Joy3` (AltFire), `Joy4` (Duck) |
+//! | X, A, B, Y | `Joy1` (Cast/Interact), `Joy2` (Jump), `Joy3` (Cycle Spell/Skip), `Joy4` (Wiggenwell) |
 //! | left / right shoulder | `Joy5` / `Joy6` |
 //! | Back | `Joy7` |
 //! | Start | `Escape` (pause menu) |
@@ -190,6 +190,158 @@ impl AxisEvents {
     }
 }
 
+/// Up to 8 gameplay events sampled once per tick from live controller axes
+/// (left stick movement, right stick look, left/right trigger axes + digital
+/// trigger press/release transitions).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GameplayAxisEvents {
+    pub items: [KeyEvent; 8],
+    pub len: usize,
+}
+
+impl GameplayAxisEvents {
+    pub fn iter(&self) -> impl Iterator<Item = KeyEvent> + '_ {
+        self.items[..self.len].iter().copied()
+    }
+
+    fn push(&mut self, event: KeyEvent) {
+        if self.len < self.items.len() {
+            self.items[self.len] = event;
+            self.len += 1;
+        }
+    }
+}
+
+/// Clears tracked digital trigger press state (used on focus loss / unplug).
+pub fn reset_triggers() {
+    TRIGGERS_DOWN.store(0, Ordering::Relaxed);
+}
+
+/// Releases any currently held digital trigger buttons (`Joy11`/`Joy12`),
+/// e.g. when entering a menu while a trigger is still pulled.
+pub fn release_held_triggers() -> AxisEvents {
+    let down = TRIGGERS_DOWN.swap(0, Ordering::Relaxed);
+    let mut out = AxisEvents::default();
+    if down == 0 {
+        return out;
+    }
+    for (index, &offset) in TRIGGER_BUTTON_OFFSET.iter().enumerate() {
+        if down & (1u8 << index) != 0 {
+            out.items[out.len] = (ik::JOY1 + offset, ist::RELEASE, 0.0);
+            out.len += 1;
+        }
+    }
+    out
+}
+
+/// Radial dead-zone normalization for a 2D analog stick (`-32768..=32767`).
+/// Returns `(0, 0)` inside the dead zone and smoothly rescales the outer ring
+/// onto the unit disk `[0, 1]` with no axial snapping.
+fn normalize_stick_2d(raw_x: i32, raw_y: i32, dead_zone: f32) -> (f32, f32) {
+    let x = (raw_x as f32 / 32768.0).clamp(-1.0, 1.0);
+    let y = (raw_y as f32 / 32768.0).clamp(-1.0, 1.0);
+    let dz = if dead_zone.is_finite() { dead_zone.clamp(0.0, 0.9) } else { 0.2 };
+    let r = x.hypot(y);
+    if r <= dz {
+        return (0.0, 0.0);
+    }
+    let scaled = ((r - dz) / (1.0 - dz)).min(1.0) / r;
+    (x * scaled, y * scaled)
+}
+
+/// Converts a per-tick snapshot of all 6 SDL GameController axes into
+/// frame-rate-independent UE1 gameplay input events.
+///
+/// UE1's `UInput::Process` accumulates `0.01 * delta * speed` for `IST_Axis`
+/// and `UInput::ReadInput` multiplies every float axis by `20.0 / dt` before
+/// `ZeroInputFloats()` clears it on the next frame. Scaling deltas by `dt`
+/// makes stick speed invariant to frame rate and matches stock keyboard speeds:
+/// - Left stick X (`JoyX`, `speed=1`): `aBaseX = ±4000` (matches `RotLeft`/`RotRight`).
+/// - Left stick Y (`JoyY`, `speed=2`, negated so UP = forward): `aBaseY = ±6000` (matches `W`/`S`).
+/// - Right stick X/Y (`MouseX`/`MouseY`): drives `SmoothMouseX`/`SmoothMouseY`
+///   so camera orbit, pitch, spell aiming, and broom control work in both
+///   Classic and Modern Third-Person modes, scaled by `GamepadLookSensitivity`.
+/// - Left/right triggers: analog `JoyZ`/`JoyR` plus hysteretic `Joy11`/`Joy12`.
+pub fn map_gameplay_axes(
+    raw_axes: [i32; 6],
+    dt: f32,
+    dead_zone: f32,
+    scale_x: f32,
+    scale_y: f32,
+    look_sensitivity: f32,
+) -> GameplayAxisEvents {
+    let mut out = GameplayAxisEvents::default();
+    if !dt.is_finite() || dt <= 0.0 {
+        return out;
+    }
+    let dt = dt.min(0.1);
+    let dz = if dead_zone.is_finite() { dead_zone.clamp(0.0, 0.9) } else { 0.2 };
+
+    // Left stick: movement (JoyX / JoyY).
+    // Guard against `expand_analog_movement` (Modern Third-Person) which expands
+    // values with `|delta| <= 1.0005`; omitting tiny deltas below 1.05 (<0.4%
+    // deflection at 60 FPS) prevents a speed jump near the dead-zone edge.
+    const JOY_X_RATE: f32 = 20_000.0;
+    const JOY_Y_RATE: f32 = 15_000.0;
+    const EXPAND_GUARD: f32 = 1.05;
+    let (lx, ly) = normalize_stick_2d(raw_axes[axis::LEFT_X as usize], raw_axes[axis::LEFT_Y as usize], dz);
+    let sx = if scale_x.is_finite() && scale_x != 0.0 { scale_x } else { 1.0 };
+    let sy = if scale_y.is_finite() && scale_y != 0.0 { scale_y } else { 1.0 };
+    let dx = lx * sx * JOY_X_RATE * dt;
+    if dx.abs() > EXPAND_GUARD {
+        out.push((ik::JOY_X, ist::AXIS, dx));
+    }
+    // Negate SDL LEFT_Y: stick UP is negative in SDL (-32768), whereas UE1
+    // MoveForward (`aBaseY Speed=+300`) is positive.
+    let dy = -ly * sy * JOY_Y_RATE * dt;
+    if dy.abs() > EXPAND_GUARD {
+        out.push((ik::JOY_Y, ist::AXIS, dy));
+    }
+
+    // Right stick: camera look & spell aiming via MouseX/MouseY (SmoothMouseX/Y).
+    const LOOK_X_RATE: f32 = 1100.0;
+    const LOOK_Y_RATE: f32 = 750.0;
+    let (rx, ry) = normalize_stick_2d(raw_axes[axis::RIGHT_X as usize], raw_axes[axis::RIGHT_Y as usize], dz);
+    let sens = if look_sensitivity.is_finite() && look_sensitivity > 0.0 { look_sensitivity } else { 1.0 };
+    let response = |v: f32| v * (0.35 + 0.65 * v.abs());
+    if rx != 0.0 {
+        out.push((ik::MOUSE_X, ist::AXIS, response(rx) * sens * LOOK_X_RATE * dt));
+    }
+    if ry != 0.0 {
+        // Negate SDL RIGHT_Y: stick UP (-32768) -> positive MouseY -> look up
+        // (matching `relative_mouse` where negative SDL dy yields positive MouseY).
+        out.push((ik::MOUSE_Y, ist::AXIS, -response(ry) * sens * LOOK_Y_RATE * dt));
+    }
+
+    // Triggers: analog JoyZ/JoyR + hysteretic digital Joy11/Joy12.
+    let triggers = [
+        (0usize, ik::JOY_Z, raw_axes[axis::TRIGGER_LEFT as usize]),
+        (1usize, ik::JOY_R, raw_axes[axis::TRIGGER_RIGHT as usize]),
+    ];
+    for (index, axis_key, raw) in triggers {
+        let v = (raw as f32 / 32768.0).clamp(0.0, 1.0);
+        if v > dz {
+            out.push((axis_key, ist::AXIS, (v - dz) / (1.0 - dz)));
+        }
+        let bit = 1u8 << index;
+        let down = TRIGGERS_DOWN.load(Ordering::Relaxed) & bit != 0;
+        let now_down = if down { raw >= TRIGGER_RELEASE } else { raw >= TRIGGER_PRESS };
+        if now_down != down {
+            if now_down {
+                TRIGGERS_DOWN.fetch_or(bit, Ordering::Relaxed);
+            } else {
+                TRIGGERS_DOWN.fetch_and(!bit, Ordering::Relaxed);
+            }
+            out.push((
+                ik::JOY1 + TRIGGER_BUTTON_OFFSET[index],
+                if now_down { ist::PRESS } else { ist::RELEASE },
+                0.0,
+            ));
+        }
+    }
+    out
+}
+
 /// Translates a controller button; `None` when unmapped.
 pub fn translate_button(button: i32, pressed: bool) -> Option<(i32, i32)> {
     button_key(button).map(|key| (key, if pressed { ist::PRESS } else { ist::RELEASE }))
@@ -290,7 +442,26 @@ mod ffi {
         pub fn SDL_GameControllerGetJoystick(controller: *mut c_void) -> *mut c_void;
         pub fn SDL_JoystickInstanceID(joystick: *mut c_void) -> i32;
         pub fn SDL_GameControllerEventState(state: i32) -> i32;
+        pub fn SDL_GameControllerGetAxis(controller: *mut c_void, axis: i32) -> i16;
     }
+}
+
+/// Samples all 6 standard SDL GameController axes from the currently open
+/// controller (`LEFT_X`, `LEFT_Y`, `RIGHT_X`, `RIGHT_Y`, `TRIGGER_LEFT`,
+/// `TRIGGER_RIGHT`). Returns `None` if no controller is open.
+#[cfg(feature = "sdl")]
+pub fn read_axes() -> Option<[i32; 6]> {
+    let slot = OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let open = slot.as_ref()?;
+    let controller = open.controller as *mut std::ffi::c_void;
+    let mut axes = [0i32; 6];
+    // SAFETY: `open.controller` is held live under the `OPEN` mutex until `close()`.
+    unsafe {
+        for (i, slot) in axes.iter_mut().enumerate() {
+            *slot = i32::from(ffi::SDL_GameControllerGetAxis(controller, i as i32));
+        }
+    }
+    Some(axes)
 }
 
 #[cfg(feature = "sdl")]
@@ -450,5 +621,49 @@ mod tests {
         assert_eq!(translate_button(button::DPAD_LEFT, true), Some((JOY_POV_LEFT, ist::PRESS)));
         assert_eq!(translate_button(button::GUIDE, true), None);
         assert!(held_key_candidates().all(|key| (0..ik::MAX).contains(&key)));
+    }
+
+    #[test]
+    fn gameplay_axes_invert_left_y_scale_with_dt_and_respect_dead_zone() {
+        reset();
+        // Centered / within dead zone emits nothing so keyboard and mouse stay untouched.
+        assert_eq!(map_gameplay_axes([1000, -1000, 500, -500, 1000, 0], 1.0 / 60.0, 0.2, 0.0, 0.0, 1.0).len, 0);
+
+        // Full left stick UP (-32768) -> positive JoyY; ReadInput yields aBaseY = +6000 at any FPS.
+        for fps in [60.0_f32, 120.0_f32] {
+            let dt = 1.0 / fps;
+            let evs = map_gameplay_axes([0, -32768, 0, 0, 0, 0], dt, 0.2, 0.0, 0.0, 1.0);
+            assert_eq!(evs.len, 1);
+            let (key, action, delta) = evs.items[0];
+            assert_eq!((key, action), (ik::JOY_Y, ist::AXIS));
+            let a_base_y = (0.01 * delta * 2.0) * (20.0 / dt);
+            assert!((a_base_y - 6000.0).abs() < 1.0, "fps={fps} aBaseY={a_base_y}");
+        }
+
+        // Full left stick RIGHT (+32767) -> positive JoyX; ReadInput yields aBaseX = +4000.
+        let dt = 1.0 / 60.0;
+        let evs = map_gameplay_axes([32767, 0, 0, 0, 0, 0], dt, 0.2, 0.0, 0.0, 1.0);
+        assert_eq!(evs.len, 1);
+        let (key, _, delta) = evs.items[0];
+        assert_eq!(key, ik::JOY_X);
+        let a_base_x = (0.01 * delta * 1.0) * (20.0 / dt);
+        assert!((a_base_x - 4000.0).abs() < 1.0, "aBaseX={a_base_x}");
+
+        // Right stick UP-RIGHT -> positive MouseX & positive MouseY, scaled by look sensitivity.
+        let r1 = map_gameplay_axes([0, 0, 32767, 0, 0, 0], dt, 0.2, 1.0, 1.0, 1.0);
+        let r2 = map_gameplay_axes([0, 0, 32767, 0, 0, 0], dt, 0.2, 1.0, 1.0, 2.0);
+        assert_eq!(r1.items[0].0, ik::MOUSE_X);
+        assert!((r2.items[0].2 - r1.items[0].2 * 2.0).abs() < 1e-3);
+        let up = map_gameplay_axes([0, 0, 0, -32768, 0, 0], dt, 0.2, 1.0, 1.0, 1.0);
+        assert_eq!(up.items[0].0, ik::MOUSE_Y);
+        assert!(up.items[0].2 > 0.0, "right stick UP must produce positive MouseY");
+
+        // Trigger pull presses Joy12; menu transition releases it cleanly.
+        let rt = map_gameplay_axes([0, 0, 0, 0, 0, 25000], dt, 0.2, 1.0, 1.0, 1.0);
+        assert!(rt.iter().any(|e| e == (ik::JOY1 + 11, ist::PRESS, 0.0)));
+        let released = release_held_triggers();
+        assert_eq!(released.iter().collect::<Vec<_>>(), vec![(ik::JOY1 + 11, ist::RELEASE, 0.0)]);
+        assert_eq!(release_held_triggers().len, 0);
+        reset();
     }
 }
