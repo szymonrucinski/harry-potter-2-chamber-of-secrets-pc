@@ -556,7 +556,16 @@ impl RenderLoop {
         if prepared.uploads.is_empty() && prepared.evicted_page.is_none() {
             return;
         }
-        self.flush_pending_batches(created);
+        let needs_flush = prepared
+            .evicted_page
+            .is_some_and(|p| self.referenced_texture_ids.contains(&native_text_page_cache_id(p)))
+            || prepared
+                .uploads
+                .iter()
+                .any(|u| self.referenced_texture_ids.contains(&native_text_page_cache_id(u.page)));
+        if needs_flush {
+            self.flush_pending_batches(created);
+        }
         let page_size = self.text_atlas.page_size();
         for upload in &prepared.uploads {
             let cache_id = native_text_page_cache_id(upload.page);

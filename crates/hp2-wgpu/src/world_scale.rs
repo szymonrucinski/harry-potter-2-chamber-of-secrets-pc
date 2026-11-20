@@ -108,6 +108,7 @@ pub(crate) struct WorldScaleState {
     post: crate::draw::WorldPost,
     scene_depth_requested: bool,
     post_pipeline: Option<(PostKey, crate::draw::WorldPostPipeline)>,
+    composited_this_frame: bool,
 }
 
 /// Color format, depth sample count and feature set a world post pipeline was built for.
@@ -127,13 +128,16 @@ impl WorldScaleState {
 
 impl Default for WorldScaleState {
     fn default() -> Self {
-        Self { percent: 100, observations: WorldScaleObservations::default(), current_frame: FrameAvailability::default(), completed_frame: FrameAvailability::default(), cached: None, active: None, pipeline: None, identity: None, msaa_setting: 0, msaa_cached: None, msaa_seed: None, post: crate::draw::WorldPost::default(), scene_depth_requested: false, post_pipeline: None }
+        Self { percent: 100, observations: WorldScaleObservations::default(), current_frame: FrameAvailability::default(), completed_frame: FrameAvailability::default(), cached: None, active: None, pipeline: None, identity: None, msaa_setting: 0, msaa_cached: None, msaa_seed: None, post: crate::draw::WorldPost::default(), scene_depth_requested: false, post_pipeline: None, composited_this_frame: false }
     }
 }
 
 impl WorldScaleState {
     pub(crate) fn is_active(&self) -> bool { self.active.is_some() }
-    pub(crate) fn begin_frame(&mut self) { self.current_frame = FrameAvailability::default(); }
+    pub(crate) fn begin_frame(&mut self) {
+        self.current_frame = FrameAvailability::default();
+        self.composited_this_frame = false;
+    }
     pub(crate) fn finish_frame(&mut self) { self.completed_frame = self.current_frame; }
     fn composition_failed(&mut self, error: &str) {
         self.current_frame.record(self.percent < 100, self.msaa_setting != 0);
@@ -515,21 +519,52 @@ impl RenderLoop {
         }
         let mut frame = self.in_progress.take().unwrap();
         let targets = self.world_scale_state.cached.take().unwrap();
-        self.world_scale_state.pipeline.as_ref().unwrap().1.record(&created.device, &mut frame.encoder,
-            self.world_scale_state.identity.as_ref().unwrap(), &frame.view, &targets.color.1);
         let msaa = if setting == 0 { None } else { self.world_scale_state.msaa_cached.take() };
-        let (target_view, depth, world_depth, samples) = if let Some(ref prepared) = msaa {
-            let color = &prepared.color.as_ref().unwrap().1;
-            self.world_scale_state.msaa_seed.as_ref().unwrap().2.record(&created.device, &mut frame.encoder,
-                self.world_scale_state.identity.as_ref().unwrap(), &targets.color.1, color);
-            (color.clone(), prepared.depth.as_ref().unwrap().clone(), Some(targets.depth), prepared.count.get())
-        } else { (targets.color.1.clone(), targets.depth, None, 1) };
+        let preserve_prior_world = self.world_scale_state.composited_this_frame;
+        let (target_view, depth, world_depth, samples) = if preserve_prior_world {
+            // A previous world scope already composited into `frame.view`, so seed
+            // from `frame.view` to preserve those pixels.
+            self.world_scale_state.pipeline.as_ref().unwrap().1.record(&created.device, &mut frame.encoder,
+                self.world_scale_state.identity.as_ref().unwrap(), &frame.view, &targets.color.1);
+            if let Some(ref prepared) = msaa {
+                let color = &prepared.color.as_ref().unwrap().1;
+                self.world_scale_state.msaa_seed.as_ref().unwrap().2.record(&created.device, &mut frame.encoder,
+                    self.world_scale_state.identity.as_ref().unwrap(), &targets.color.1, color);
+                (color.clone(), prepared.depth.as_ref().unwrap().clone(), Some(targets.depth), prepared.count.get())
+            } else {
+                (targets.color.1.clone(), targets.depth, None, 1)
+            }
+        } else if let Some(ref prepared) = msaa {
+            let color = prepared.color.as_ref().unwrap().1.clone();
+            (color, prepared.depth.as_ref().unwrap().clone(), Some(targets.depth), prepared.count.get())
+        } else {
+            (targets.color.1.clone(), targets.depth, None, 1)
+        };
         let full_view = std::mem::replace(&mut frame.view, target_view);
         let full_depth = self.depth_target.replace(depth);
         frame.samples = samples;
-        {
+        if preserve_prior_world {
             let _clear = frame.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scaled world depth clear"), color_attachments: &[],
+                depth_stencil_attachment: Some(crate::depth_clear_attachment(&self.depth_target.as_ref().unwrap().1)),
+                ..Default::default()
+            });
+        } else {
+            // Fast path (first world scope of the frame): `has_prior_color` above is
+            // guaranteed false, so `frame.view` holds only `frame.clear_color`. Clear
+            // color and depth directly in a single pass instead of running two
+            // fullscreen seed blits plus a separate depth-clear pass.
+            let _clear = frame.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scaled world clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &frame.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(frame.clear_color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
                 depth_stencil_attachment: Some(crate::depth_clear_attachment(&self.depth_target.as_ref().unwrap().1)),
                 ..Default::default()
             });
@@ -545,13 +580,24 @@ impl RenderLoop {
         let Some(scope) = self.world_scale_state.active.take() else { return Ok(()); };
         let mut frame = self.in_progress.take().ok_or("scaled world frame was lost")?;
         let batches = std::mem::take(&mut self.batches);
-        crate::dispatch_batches(created, self, &mut frame, batches);
-        if scope.msaa.is_some() {
+        let resolve_target = scope.msaa.is_some().then_some(&scope.world_color.1);
+        let discard_color = scope.msaa.is_some();
+        let discard_depth = !self.world_scale_state.depth_sampleable();
+        let resolved_inline = crate::dispatch_batches_with_options(
+            created,
+            self,
+            &mut frame,
+            batches,
+            resolve_target,
+            discard_color,
+            discard_depth,
+        );
+        if scope.msaa.is_some() && !resolved_inline {
             let _resolve = frame.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("resolve multisampled world"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &frame.view, depth_slice: None, resolve_target: Some(&scope.world_color.1),
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard },
                 })], ..Default::default()
             });
         }
@@ -577,6 +623,7 @@ impl RenderLoop {
         let world_depth = scope.world_depth.unwrap_or(drawn_depth);
         self.world_scale_state.cached = Some(PreparedLogicalTargets { color: scope.world_color, depth: world_depth });
         self.world_scale_state.msaa_cached = scope.msaa;
+        self.world_scale_state.composited_this_frame = true;
         self.in_progress = Some(frame);
         post_error.map_or(Ok(()), Err)
     }

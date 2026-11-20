@@ -904,6 +904,10 @@ struct PageUi {
     art_requested: bool,
     /// Canvas `SizeX`/`SizeY` the text widths in `metrics` were measured at.
     measured_at: (i32, i32),
+    /// Re-read stock controls and INI keys on the next paint (set after executing commands or resizing).
+    needs_refresh: bool,
+    /// Timestamp of the last stock-control refresh (periodic 250ms sync catches external console changes).
+    last_refresh: std::time::Instant,
 }
 
 thread_local! {
@@ -1033,7 +1037,17 @@ unsafe fn create(a: CoreAccess<'_>, page: *mut UObject) -> RuntimeResult<PageUi>
     ui.resize(640., 480.);
     let handles = unsafe { Handles::resolve(a, page)? };
     unsafe { refresh(a, &data, &handles)? };
-    Ok(PageUi { page: unsafe { Weak::new(page) }, ui, data, metrics, hidden: false, art_requested: false, measured_at: (0, 0) })
+    Ok(PageUi {
+        page: unsafe { Weak::new(page) },
+        ui,
+        data,
+        metrics,
+        hidden: false,
+        art_requested: false,
+        measured_at: (0, 0),
+        needs_refresh: false,
+        last_refresh: std::time::Instant::now(),
+    })
 }
 
 /// Removes every stock control except the Back button from the page's window list.
@@ -1070,12 +1084,6 @@ unsafe fn paint_callback(a: CoreAccess<'_>, receiver: *mut UObject, function: *m
             let load = !entry.art_requested;
             entry.art_requested = true;
             entry.data.art.set(unsafe { menu_art(a, receiver, load) });
-            // While a command is waiting for the next tick, the stock controls are stale: do not overwrite the view.
-            if entry.data.queue.borrow().is_empty() {
-                let handles = unsafe { Handles::resolve(a, receiver)? };
-                unsafe { refresh(a, &entry.data, &handles)? };
-            }
-            entry.ui.update();
             // This page changes the resolution and UI scale itself: widths measured at another
             // canvas size would misplace centred and right-aligned text, so measure again.
             let size_of_canvas = |name: &str| unsafe { prop(a, canvas, name, "Core.IntProperty", 4).map(|p| p.cast::<i32>().read_unaligned()) };
@@ -1083,7 +1091,19 @@ unsafe fn paint_callback(a: CoreAccess<'_>, receiver: *mut UObject, function: *m
             if entry.measured_at != canvas_size {
                 entry.measured_at = canvas_size;
                 entry.metrics.clear();
+                entry.needs_refresh = true;
             }
+            // While a command is waiting for the next tick, the stock controls are stale: do not overwrite the view.
+            // Avoid re-walking stock combo lists and re-reading 11 INI keys on every paint when nothing changed.
+            if entry.data.queue.borrow().is_empty()
+                && (entry.needs_refresh || entry.last_refresh.elapsed() >= std::time::Duration::from_millis(250))
+            {
+                let handles = unsafe { Handles::resolve(a, receiver)? };
+                unsafe { refresh(a, &entry.data, &handles)? };
+                entry.needs_refresh = false;
+                entry.last_refresh = std::time::Instant::now();
+            }
+            entry.ui.update();
             let mut learned = false;
             for (text_value, font) in entry.ui.text_requests() {
                 if !entry.metrics.knows(&text_value, font) {
@@ -1291,6 +1311,7 @@ pub(crate) unsafe fn tick(a: CoreAccess<'_>) -> RuntimeResult<()> {
         for command in commands {
             unsafe { execute(a, page, &handles, command)? };
         }
+        with_page(a, page, |p| p.needs_refresh = true);
     }
     Ok(())
 }

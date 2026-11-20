@@ -328,10 +328,103 @@ fn alpha_factor(factor: wgpu::BlendFactor) -> wgpu::BlendFactor {
 /// build matching bind groups without re-deriving the layout by hand
 /// (wgpu's own `get_bind_group_layout` is the only way to retrieve a
 /// derived layout after the fact).
+fn device_supports_storage_draw_params(device: &wgpu::Device) -> bool {
+    device.limits().max_storage_buffers_per_shader_stage >= 1
+}
+
+fn draw_params_shader_source(
+    base: &'static str,
+    use_storage: bool,
+) -> std::borrow::Cow<'static, str> {
+    if use_storage {
+        const UNIFORM_DECL: &str =
+            "@group(1) @binding(0) var<uniform> draw_params: array<DrawParameters, MAX_DRAWS>;";
+        const STORAGE_DECL: &str =
+            "@group(1) @binding(0) var<storage, read> draw_params: array<DrawParameters>;";
+        debug_assert!(base.contains(UNIFORM_DECL));
+        std::borrow::Cow::Owned(base.replacen(UNIFORM_DECL, STORAGE_DECL, 1))
+    } else {
+        std::borrow::Cow::Borrowed(base)
+    }
+}
+
+fn create_single_draw_params_buffer<P: bytemuck::Pod + Copy>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    draw_params: &[P],
+    use_storage: bool,
+) -> wgpu::Buffer {
+    if use_storage {
+        let zero = P::zeroed();
+        let slice = if draw_params.is_empty() {
+            std::slice::from_ref(&zero)
+        } else {
+            draw_params
+        };
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: std::mem::size_of_val(slice) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buf, 0, bytemuck::cast_slice(slice));
+        buf
+    } else {
+        let mut padded = vec![P::zeroed(); MAX_DRAWS];
+        padded[..draw_params.len()].copy_from_slice(draw_params);
+        let buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: (MAX_DRAWS * std::mem::size_of::<P>()) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&buf, 0, bytemuck::cast_slice(&padded));
+        buf
+    }
+}
+
+trait HasDrawId: bytemuck::Pod + Copy {
+    fn with_draw_id_offset(self, offset: u32) -> Self;
+}
+
+impl HasDrawId for LineVertex {
+    #[inline]
+    fn with_draw_id_offset(mut self, offset: u32) -> Self {
+        self.draw_id += offset;
+        self
+    }
+}
+
+impl HasDrawId for TileVertex {
+    #[inline]
+    fn with_draw_id_offset(mut self, offset: u32) -> Self {
+        self.draw_id += offset;
+        self
+    }
+}
+
+impl HasDrawId for GouraudVertex {
+    #[inline]
+    fn with_draw_id_offset(mut self, offset: u32) -> Self {
+        self.draw_id += offset;
+        self
+    }
+}
+
+impl HasDrawId for ComplexVertex {
+    #[inline]
+    fn with_draw_id_offset(mut self, offset: u32) -> Self {
+        self.draw_id += offset;
+        self
+    }
+}
+
 pub struct SimpleLinePipeline {
     pipeline: wgpu::RenderPipeline,
     frame_uniforms_layout: wgpu::BindGroupLayout,
     draw_params_layout: wgpu::BindGroupLayout,
+    use_storage_params: bool,
 }
 
 impl SimpleLinePipeline {
@@ -347,9 +440,13 @@ impl SimpleLinePipeline {
     }
 
     pub fn new_with_samples(device: &wgpu::Device, color_format: wgpu::TextureFormat, state: RenderState, samples: u32) -> Self {
+        let use_storage_params = device_supports_storage_draw_params(device);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("simple.wgsl (draw.rs production)"),
-            source: wgpu::ShaderSource::Wgsl(SIMPLE_WGSL_SOURCE.into()),
+            source: wgpu::ShaderSource::Wgsl(draw_params_shader_source(
+                SIMPLE_WGSL_SOURCE,
+                use_storage_params,
+            )),
         });
         // Matches VertexInput: @location(0) coords: vec3<f32>,
         // @location(1) draw_id: u32 -- same shape already proven
@@ -401,6 +498,7 @@ impl SimpleLinePipeline {
             pipeline,
             frame_uniforms_layout,
             draw_params_layout,
+            use_storage_params,
         }
     }
 
@@ -455,27 +553,13 @@ impl SimpleLinePipeline {
         });
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices));
 
-        // draw_params is a fixed-size MAX_DRAWS array in the real
-        // shader (WGSL uniform arrays need a const-expression length,
-        // this crate's own module doc already has the full reasoning
-        // for why), so the uniform buffer backing it is always the
-        // full MAX_DRAWS size regardless of how many entries the
-        // caller actually supplied -- padded with zeroed entries
-        // rather than a buffer sized to just `draw_params.len()`.
-        let mut padded_params = vec![
-            DrawParams {
-                draw_color: [0.0; 4]
-            };
-            MAX_DRAWS
-        ];
-        padded_params[..draw_params.len()].copy_from_slice(draw_params);
-        let draw_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("draw.rs line draw-params buffer"),
-            size: (MAX_DRAWS * std::mem::size_of::<DrawParams>()) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&draw_params_buffer, 0, bytemuck::cast_slice(&padded_params));
+        let draw_params_buffer = create_single_draw_params_buffer(
+            device,
+            queue,
+            "draw.rs line draw-params buffer",
+            draw_params,
+            self.use_storage_params,
+        );
 
         let frame_uniforms_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("draw.rs frame uniforms bind group"),
@@ -570,6 +654,7 @@ pub struct SimpleTrianglePipeline {
     pipeline: wgpu::RenderPipeline,
     frame_uniforms_layout: wgpu::BindGroupLayout,
     draw_params_layout: wgpu::BindGroupLayout,
+    use_storage_params: bool,
 }
 
 impl SimpleTrianglePipeline {
@@ -586,9 +671,13 @@ impl SimpleTrianglePipeline {
     }
 
     pub fn new_with_samples(device: &wgpu::Device, color_format: wgpu::TextureFormat, state: RenderState, samples: u32) -> Self {
+        let use_storage_params = device_supports_storage_draw_params(device);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("simple.wgsl (draw.rs triangle production)"),
-            source: wgpu::ShaderSource::Wgsl(SIMPLE_WGSL_SOURCE.into()),
+            source: wgpu::ShaderSource::Wgsl(draw_params_shader_source(
+                SIMPLE_WGSL_SOURCE,
+                use_storage_params,
+            )),
         });
         let vertex_attributes = [
             wgpu::VertexAttribute {
@@ -636,6 +725,7 @@ impl SimpleTrianglePipeline {
             pipeline,
             frame_uniforms_layout,
             draw_params_layout,
+            use_storage_params,
         }
     }
 
@@ -678,20 +768,13 @@ impl SimpleTrianglePipeline {
         });
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices));
 
-        let mut padded_params = vec![
-            DrawParams {
-                draw_color: [0.0; 4]
-            };
-            MAX_DRAWS
-        ];
-        padded_params[..draw_params.len()].copy_from_slice(draw_params);
-        let draw_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("draw.rs triangle draw-params buffer"),
-            size: (MAX_DRAWS * std::mem::size_of::<DrawParams>()) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&draw_params_buffer, 0, bytemuck::cast_slice(&padded_params));
+        let draw_params_buffer = create_single_draw_params_buffer(
+            device,
+            queue,
+            "draw.rs triangle draw-params buffer",
+            draw_params,
+            self.use_storage_params,
+        );
 
         let frame_uniforms_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("draw.rs triangle frame uniforms bind group"),
@@ -1169,6 +1252,7 @@ pub struct TilePipeline {
     frame_uniforms_layout: wgpu::BindGroupLayout,
     draw_params_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
+    use_storage_params: bool,
 }
 
 impl TilePipeline {
@@ -1181,11 +1265,15 @@ impl TilePipeline {
     }
 
     pub fn new_with_samples(device: &wgpu::Device, color_format: wgpu::TextureFormat, state: RenderState, samples: u32) -> Self {
+        let use_storage_params = device_supports_storage_draw_params(device);
         let a2c = alpha_to_coverage(samples, state);
         let constants = quality_constants(a2c);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile.wgsl (draw.rs production)"),
-            source: wgpu::ShaderSource::Wgsl(TILE_WGSL_SOURCE.into()),
+            source: wgpu::ShaderSource::Wgsl(draw_params_shader_source(
+                TILE_WGSL_SOURCE,
+                use_storage_params,
+            )),
         });
         let vertex_attributes = [
             wgpu::VertexAttribute {
@@ -1237,6 +1325,7 @@ impl TilePipeline {
             frame_uniforms_layout,
             draw_params_layout,
             texture_layout,
+            use_storage_params,
         }
     }
 
@@ -1284,22 +1373,13 @@ impl TilePipeline {
         });
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices));
 
-        let mut padded_params = vec![
-            TileDrawParams {
-                draw_color: [0.0; 4],
-                draw_flags: 0,
-                _padding: [0; 3],
-            };
-            MAX_DRAWS
-        ];
-        padded_params[..draw_params.len()].copy_from_slice(draw_params);
-        let draw_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("draw.rs tile draw-params buffer"),
-            size: (MAX_DRAWS * std::mem::size_of::<TileDrawParams>()) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&draw_params_buffer, 0, bytemuck::cast_slice(&padded_params));
+        let draw_params_buffer = create_single_draw_params_buffer(
+            device,
+            queue,
+            "draw.rs tile draw-params buffer",
+            draw_params,
+            self.use_storage_params,
+        );
 
         let frame_uniforms_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("draw.rs tile frame uniforms bind group"),
@@ -1482,6 +1562,7 @@ pub struct GouraudPipeline {
     frame_uniforms_layout: wgpu::BindGroupLayout,
     draw_params_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
+    use_storage_params: bool,
 }
 
 impl GouraudPipeline {
@@ -1494,11 +1575,15 @@ impl GouraudPipeline {
     }
 
     pub fn new_with_samples(device: &wgpu::Device, color_format: wgpu::TextureFormat, state: RenderState, samples: u32) -> Self {
+        let use_storage_params = device_supports_storage_draw_params(device);
         let a2c = alpha_to_coverage(samples, state);
         let constants = quality_constants(a2c);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gouraud.wgsl (draw.rs production)"),
-            source: wgpu::ShaderSource::Wgsl(GOURAUD_WGSL_SOURCE.into()),
+            source: wgpu::ShaderSource::Wgsl(draw_params_shader_source(
+                GOURAUD_WGSL_SOURCE,
+                use_storage_params,
+            )),
         });
         let vertex_attributes = [
             wgpu::VertexAttribute {
@@ -1560,6 +1645,7 @@ impl GouraudPipeline {
             frame_uniforms_layout,
             draw_params_layout,
             texture_layout,
+            use_storage_params,
         }
     }
 
@@ -1607,23 +1693,13 @@ impl GouraudPipeline {
         });
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices));
 
-        let mut padded_params = vec![
-            GouraudDrawParams {
-                diffuse_info: [0.0; 4],
-                draw_color: [0.0; 4],
-                draw_flags: 0,
-                _padding: [0; 3],
-            };
-            MAX_DRAWS
-        ];
-        padded_params[..draw_params.len()].copy_from_slice(draw_params);
-        let draw_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("draw.rs gouraud draw-params buffer"),
-            size: (MAX_DRAWS * std::mem::size_of::<GouraudDrawParams>()) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&draw_params_buffer, 0, bytemuck::cast_slice(&padded_params));
+        let draw_params_buffer = create_single_draw_params_buffer(
+            device,
+            queue,
+            "draw.rs gouraud draw-params buffer",
+            draw_params,
+            self.use_storage_params,
+        );
 
         let frame_uniforms_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("draw.rs gouraud frame uniforms bind group"),
@@ -1809,6 +1885,7 @@ pub struct ComplexPipeline {
     frame_uniforms_layout: wgpu::BindGroupLayout,
     draw_params_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
+    use_storage_params: bool,
 }
 
 impl ComplexPipeline {
@@ -1821,11 +1898,15 @@ impl ComplexPipeline {
     }
 
     pub fn new_with_samples(device: &wgpu::Device, color_format: wgpu::TextureFormat, state: RenderState, samples: u32) -> Self {
+        let use_storage_params = device_supports_storage_draw_params(device);
         let a2c = alpha_to_coverage(samples, state);
         let constants = quality_constants(a2c);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("complex.wgsl (draw.rs production)"),
-            source: wgpu::ShaderSource::Wgsl(COMPLEX_WGSL_SOURCE.into()),
+            source: wgpu::ShaderSource::Wgsl(draw_params_shader_source(
+                COMPLEX_WGSL_SOURCE,
+                use_storage_params,
+            )),
         });
         let vertex_attributes = [
             wgpu::VertexAttribute {
@@ -1872,6 +1953,7 @@ impl ComplexPipeline {
             frame_uniforms_layout,
             draw_params_layout,
             texture_layout,
+            use_storage_params,
         }
     }
 
@@ -1921,27 +2003,13 @@ impl ComplexPipeline {
         });
         queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(vertices));
 
-        let mut padded_params = vec![
-            ComplexDrawParams {
-                diffuse_uv: [0.0; 4],
-                light_map_uv: [0.0; 4],
-                fog_map_uv: [0.0; 4],
-                diffuse_info: [0.0; 4],
-                x_axis: [0.0; 4],
-                y_axis: [0.0; 4],
-                draw_flags: 0,
-                _padding: [0; 3],
-            };
-            MAX_DRAWS
-        ];
-        padded_params[..draw_params.len()].copy_from_slice(draw_params);
-        let draw_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("draw.rs complex draw-params buffer"),
-            size: (MAX_DRAWS * std::mem::size_of::<ComplexDrawParams>()) as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&draw_params_buffer, 0, bytemuck::cast_slice(&padded_params));
+        let draw_params_buffer = create_single_draw_params_buffer(
+            device,
+            queue,
+            "draw.rs complex draw-params buffer",
+            draw_params,
+            self.use_storage_params,
+        );
 
         let frame_uniforms_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("draw.rs complex frame uniforms bind group"),
@@ -2079,9 +2147,15 @@ struct ArenaDraw<'a> {
 ///   to pass through an 8-bit store and reload between passes now stays in tile
 ///   memory, which changes a few blended pixels (see `Build/frame_equiv.py`).
 pub struct DrawArena<'a> {
+    use_storage: Option<bool>,
     vertex_bytes: Vec<u8>,
+    simple_params: Vec<DrawParams>,
+    tile_params: Vec<TileDrawParams>,
+    gouraud_params: Vec<GouraudDrawParams>,
+    complex_params: Vec<ComplexDrawParams>,
+    /// Uniform-fallback packed parameter bytes (used only when storage buffers are unavailable).
     param_bytes: Vec<u8>,
-    /// (offset in the params buffer, range in `param_bytes`, window size) for each draw.
+    /// (offset in the params buffer, range in `param_bytes`, window size) for each uniform draw.
     param_chunks: Vec<(u64, std::ops::Range<usize>, u64)>,
     params_next: u64,
     params_required: u64,
@@ -2091,7 +2165,12 @@ pub struct DrawArena<'a> {
 impl Default for DrawArena<'_> {
     fn default() -> Self {
         Self {
+            use_storage: None,
             vertex_bytes: Vec::new(),
+            simple_params: Vec::new(),
+            tile_params: Vec::new(),
+            gouraud_params: Vec::new(),
+            complex_params: Vec::new(),
             param_bytes: Vec::new(),
             param_chunks: Vec::new(),
             params_next: 0,
@@ -2106,7 +2185,31 @@ impl<'a> DrawArena<'a> {
         self.draws.is_empty()
     }
 
-    fn push<V: bytemuck::Pod, P: bytemuck::Pod>(
+    fn record_storage_mode(&mut self, use_storage: bool) {
+        match self.use_storage {
+            Some(prev) => assert_eq!(
+                prev, use_storage,
+                "DrawArena cannot mix storage and uniform draw-params pipelines"
+            ),
+            None => self.use_storage = Some(use_storage),
+        }
+    }
+
+    fn append_vertices<V: HasDrawId>(&mut self, vertices: &[V], base_id: u32) -> (u64, u64) {
+        let vertex_offset = self.vertex_bytes.len() as u64;
+        if base_id == 0 {
+            self.vertex_bytes.extend_from_slice(bytemuck::cast_slice(vertices));
+        } else {
+            self.vertex_bytes.reserve(std::mem::size_of_val(vertices));
+            for &v in vertices {
+                let shifted = v.with_draw_id_offset(base_id);
+                self.vertex_bytes.extend_from_slice(bytemuck::bytes_of(&shifted));
+            }
+        }
+        (vertex_offset, std::mem::size_of_val(vertices) as u64)
+    }
+
+    fn push_uniform<V: bytemuck::Pod, P: bytemuck::Pod>(
         &mut self,
         kind: ArenaKind<'a>,
         frame_uniforms: &'a wgpu::Buffer,
@@ -2125,6 +2228,9 @@ impl<'a> DrawArena<'a> {
             "{what} topology needs a vertex count that is a multiple of {vertices_per_primitive}, got {}",
             vertices.len()
         );
+        if vertices.is_empty() {
+            return;
+        }
         let vertex_offset = self.vertex_bytes.len() as u64;
         self.vertex_bytes.extend_from_slice(bytemuck::cast_slice(vertices));
         let used = std::mem::size_of_val(draw_params);
@@ -2148,32 +2254,82 @@ impl<'a> DrawArena<'a> {
     }
 
     pub fn push_line(&mut self, pipeline: &'a SimpleLinePipeline, frame_uniforms: &'a wgpu::Buffer, vertices: &[LineVertex], draw_params: &[DrawParams]) {
-        self.push(ArenaKind::Line(pipeline), frame_uniforms, vertices, draw_params, 2, "line");
+        self.record_storage_mode(pipeline.use_storage_params);
+        if pipeline.use_storage_params {
+            assert!(vertices.len().is_multiple_of(2), "line topology needs a vertex count that is a multiple of 2, got {}", vertices.len());
+            if vertices.is_empty() || draw_params.is_empty() { return; }
+            let base_id = self.simple_params.len() as u32;
+            self.simple_params.extend_from_slice(draw_params);
+            let (vertex_offset, vertex_bytes) = self.append_vertices(vertices, base_id);
+            self.draws.push(ArenaDraw { kind: ArenaKind::Line(pipeline), frame_uniforms, vertex_offset, vertex_bytes, vertex_count: vertices.len() as u32, params_offset: 0, params_binding: 0 });
+        } else {
+            self.push_uniform(ArenaKind::Line(pipeline), frame_uniforms, vertices, draw_params, 2, "line");
+        }
     }
 
     pub fn push_point(&mut self, pipeline: &'a SimpleTrianglePipeline, frame_uniforms: &'a wgpu::Buffer, vertices: &[LineVertex], draw_params: &[DrawParams]) {
-        self.push(ArenaKind::Point(pipeline), frame_uniforms, vertices, draw_params, 3, "triangle");
+        self.record_storage_mode(pipeline.use_storage_params);
+        if pipeline.use_storage_params {
+            assert!(vertices.len().is_multiple_of(3), "triangle topology needs a vertex count that is a multiple of 3, got {}", vertices.len());
+            if vertices.is_empty() || draw_params.is_empty() { return; }
+            let base_id = self.simple_params.len() as u32;
+            self.simple_params.extend_from_slice(draw_params);
+            let (vertex_offset, vertex_bytes) = self.append_vertices(vertices, base_id);
+            self.draws.push(ArenaDraw { kind: ArenaKind::Point(pipeline), frame_uniforms, vertex_offset, vertex_bytes, vertex_count: vertices.len() as u32, params_offset: 0, params_binding: 0 });
+        } else {
+            self.push_uniform(ArenaKind::Point(pipeline), frame_uniforms, vertices, draw_params, 3, "triangle");
+        }
     }
 
     pub fn push_tile(
         &mut self, pipeline: &'a TilePipeline, frame_uniforms: &'a wgpu::Buffer, vertices: &[TileVertex],
         draw_params: &[TileDrawParams], texture_view: &'a wgpu::TextureView, sampler: &'a wgpu::Sampler,
     ) {
-        self.push(ArenaKind::Tile(pipeline, texture_view, sampler), frame_uniforms, vertices, draw_params, 3, "tile");
+        self.record_storage_mode(pipeline.use_storage_params);
+        if pipeline.use_storage_params {
+            assert!(vertices.len().is_multiple_of(3), "tile topology needs a vertex count that is a multiple of 3, got {}", vertices.len());
+            if vertices.is_empty() || draw_params.is_empty() { return; }
+            let base_id = self.tile_params.len() as u32;
+            self.tile_params.extend_from_slice(draw_params);
+            let (vertex_offset, vertex_bytes) = self.append_vertices(vertices, base_id);
+            self.draws.push(ArenaDraw { kind: ArenaKind::Tile(pipeline, texture_view, sampler), frame_uniforms, vertex_offset, vertex_bytes, vertex_count: vertices.len() as u32, params_offset: 0, params_binding: 0 });
+        } else {
+            self.push_uniform(ArenaKind::Tile(pipeline, texture_view, sampler), frame_uniforms, vertices, draw_params, 3, "tile");
+        }
     }
 
     pub fn push_gouraud(
         &mut self, pipeline: &'a GouraudPipeline, frame_uniforms: &'a wgpu::Buffer, vertices: &[GouraudVertex],
         draw_params: &[GouraudDrawParams], texture_view: &'a wgpu::TextureView, sampler: &'a wgpu::Sampler,
     ) {
-        self.push(ArenaKind::Gouraud(pipeline, texture_view, sampler), frame_uniforms, vertices, draw_params, 3, "gouraud");
+        self.record_storage_mode(pipeline.use_storage_params);
+        if pipeline.use_storage_params {
+            assert!(vertices.len().is_multiple_of(3), "gouraud topology needs a vertex count that is a multiple of 3, got {}", vertices.len());
+            if vertices.is_empty() || draw_params.is_empty() { return; }
+            let base_id = self.gouraud_params.len() as u32;
+            self.gouraud_params.extend_from_slice(draw_params);
+            let (vertex_offset, vertex_bytes) = self.append_vertices(vertices, base_id);
+            self.draws.push(ArenaDraw { kind: ArenaKind::Gouraud(pipeline, texture_view, sampler), frame_uniforms, vertex_offset, vertex_bytes, vertex_count: vertices.len() as u32, params_offset: 0, params_binding: 0 });
+        } else {
+            self.push_uniform(ArenaKind::Gouraud(pipeline, texture_view, sampler), frame_uniforms, vertices, draw_params, 3, "gouraud");
+        }
     }
 
     pub fn push_complex(
         &mut self, pipeline: &'a ComplexPipeline, frame_uniforms: &'a wgpu::Buffer, vertices: &[ComplexVertex],
         draw_params: &[ComplexDrawParams], textures: [(&'a wgpu::TextureView, &'a wgpu::Sampler); 3],
     ) {
-        self.push(ArenaKind::Complex(pipeline, textures), frame_uniforms, vertices, draw_params, 3, "complex");
+        self.record_storage_mode(pipeline.use_storage_params);
+        if pipeline.use_storage_params {
+            assert!(vertices.len().is_multiple_of(3), "complex topology needs a vertex count that is a multiple of 3, got {}", vertices.len());
+            if vertices.is_empty() || draw_params.is_empty() { return; }
+            let base_id = self.complex_params.len() as u32;
+            self.complex_params.extend_from_slice(draw_params);
+            let (vertex_offset, vertex_bytes) = self.append_vertices(vertices, base_id);
+            self.draws.push(ArenaDraw { kind: ArenaKind::Complex(pipeline, textures), frame_uniforms, vertex_offset, vertex_bytes, vertex_count: vertices.len() as u32, params_offset: 0, params_binding: 0 });
+        } else {
+            self.push_uniform(ArenaKind::Complex(pipeline, textures), frame_uniforms, vertices, draw_params, 3, "complex");
+        }
     }
 
     /// Uploads the packed data once per buffer and records every draw into one
@@ -2186,14 +2342,28 @@ impl<'a> DrawArena<'a> {
         target: &wgpu::TextureView,
         depth_target: &wgpu::TextureView,
     ) {
+        self.submit_with_options(device, queue, encoder, target, depth_target, None, false, false);
+    }
+
+    /// Like [`Self::submit`], with optional inline MSAA resolve and color/depth
+    /// `StoreOp::Discard` for the final world render pass. Returns `true` when
+    /// a render pass was recorded (`false` when the arena was empty).
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_with_options(
+        self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        depth_target: &wgpu::TextureView,
+        resolve_target: Option<&wgpu::TextureView>,
+        discard_color: bool,
+        discard_depth: bool,
+    ) -> bool {
         if self.draws.is_empty() {
-            return;
+            return false;
         }
-        let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
-        assert!(
-            alignment != 0 && ARENA_UNIFORM_ALIGNMENT.is_multiple_of(alignment),
-            "device uniform offset alignment {alignment} does not divide {ARENA_UNIFORM_ALIGNMENT}"
-        );
+        let use_storage = self.use_storage.unwrap_or(false);
         let vertex_len = (self.vertex_bytes.len() as u64).next_multiple_of(4);
         let vertex_buffer = &device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("draw.rs arena vertices"),
@@ -2201,23 +2371,64 @@ impl<'a> DrawArena<'a> {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let params_buffer = &device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("draw.rs arena draw params"),
-            size: self.params_required,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         {
             let mut view = queue
                 .write_buffer_with(vertex_buffer, 0, std::num::NonZeroU64::new(vertex_len).expect("non-empty"))
                 .expect("arena vertex staging buffer");
             view.slice(..self.vertex_bytes.len()).copy_from_slice(&self.vertex_bytes);
         }
-        {
+
+        let mut storage_bucket_ranges: [Option<(u64, u64)>; 4] = [None; 4];
+        let params_buffer = if use_storage {
+            let align = u64::from(device.limits().min_storage_buffer_offset_alignment).max(4);
+            let slices: [&[u8]; 4] = [
+                bytemuck::cast_slice(&self.simple_params),
+                bytemuck::cast_slice(&self.tile_params),
+                bytemuck::cast_slice(&self.gouraud_params),
+                bytemuck::cast_slice(&self.complex_params),
+            ];
+            let mut cursor: u64 = 0;
+            for (i, bytes) in slices.iter().enumerate() {
+                if !bytes.is_empty() {
+                    let len = bytes.len() as u64;
+                    storage_bucket_ranges[i] = Some((cursor, len));
+                    cursor = (cursor + len).next_multiple_of(align);
+                }
+            }
+            let total_size = cursor.max(4);
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("draw.rs arena storage draw params"),
+                size: total_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            {
+                let mut view = queue
+                    .write_buffer_with(&buffer, 0, std::num::NonZeroU64::new(total_size).expect("non-empty"))
+                    .expect("arena storage params staging buffer");
+                for (i, bytes) in slices.iter().enumerate() {
+                    if let Some((offset, len)) = storage_bucket_ranges[i] {
+                        let start = offset as usize;
+                        view.slice(start..start + len as usize).copy_from_slice(bytes);
+                    }
+                }
+            }
+            buffer
+        } else {
+            let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
+            assert!(
+                alignment != 0 && ARENA_UNIFORM_ALIGNMENT.is_multiple_of(alignment),
+                "device uniform offset alignment {alignment} does not divide {ARENA_UNIFORM_ALIGNMENT}"
+            );
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("draw.rs arena draw params"),
+                size: self.params_required,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
             let span = self.params_required;
             let mut view = queue
-                .write_buffer_with(params_buffer, 0, std::num::NonZeroU64::new(span).expect("non-empty"))
+                .write_buffer_with(&buffer, 0, std::num::NonZeroU64::new(span).expect("non-empty"))
                 .expect("arena params staging buffer");
             for (offset, range, window) in &self.param_chunks {
                 let offset = *offset as usize;
@@ -2230,18 +2441,24 @@ impl<'a> DrawArena<'a> {
                 assert!(tail <= ARENA_ZEROS.len(), "draw parameter window larger than the zero page");
                 view.slice(offset + used..offset + *window as usize).copy_from_slice(&ARENA_ZEROS[..tail]);
             }
-        }
+            buffer
+        };
+        let params_buffer = &params_buffer;
 
         struct Binds {
             frame_idx: usize,
-            params: wgpu::BindGroup,
+            params_idx: usize,
             texture_idx: Option<usize>,
         }
-        // Deduplicate per-frame frame-uniforms and texture bind groups within the pass.
-        // Auto-derived bind group layouts are unique per pipeline object, so keying by the
-        // layout pointer guarantees exact WebGPU layout compatibility.
+        // Deduplicate per-frame frame-uniforms, storage draw-params, and texture bind groups
+        // within the pass. Auto-derived bind group layouts are unique per pipeline object, so
+        // keying by the layout pointer guarantees exact WebGPU layout compatibility.
         let mut frame_bind_groups: Vec<wgpu::BindGroup> = Vec::with_capacity(8);
         let mut frame_bind_map: std::collections::HashMap<(usize, usize), usize> =
+            std::collections::HashMap::with_capacity(8);
+        let mut params_bind_groups: Vec<wgpu::BindGroup> =
+            Vec::with_capacity(if use_storage { 8 } else { self.draws.len() });
+        let mut storage_params_map: std::collections::HashMap<(usize, usize), usize> =
             std::collections::HashMap::with_capacity(8);
         let mut tex_bind_groups: Vec<wgpu::BindGroup> = Vec::with_capacity(32);
         let mut single_tex_map: std::collections::HashMap<(usize, usize, usize), usize> =
@@ -2251,6 +2468,7 @@ impl<'a> DrawArena<'a> {
 
         let mut make = |layout_frame: &wgpu::BindGroupLayout,
                         layout_params: &wgpu::BindGroupLayout,
+                        bucket: usize,
                         draw: &ArenaDraw<'_>| {
             let frame_key = (
                 layout_frame as *const wgpu::BindGroupLayout as usize,
@@ -2268,33 +2486,57 @@ impl<'a> DrawArena<'a> {
                 }));
                 idx
             });
-            let params = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("draw.rs arena draw params bind group"),
-                layout: layout_params,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: params_buffer,
-                        offset: draw.params_offset,
-                        size: std::num::NonZeroU64::new(draw.params_binding),
-                    }),
-                }],
-            });
-            (frame_idx, params)
+            let params_idx = if use_storage {
+                let pkey = (layout_params as *const wgpu::BindGroupLayout as usize, bucket);
+                *storage_params_map.entry(pkey).or_insert_with(|| {
+                    let (offset, len) = storage_bucket_ranges[bucket]
+                        .expect("storage bucket populated for draw kind");
+                    let idx = params_bind_groups.len();
+                    params_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("draw.rs arena storage draw params bind group"),
+                        layout: layout_params,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: params_buffer,
+                                offset,
+                                size: std::num::NonZeroU64::new(len),
+                            }),
+                        }],
+                    }));
+                    idx
+                })
+            } else {
+                let idx = params_bind_groups.len();
+                params_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("draw.rs arena draw params bind group"),
+                    layout: layout_params,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: params_buffer,
+                            offset: draw.params_offset,
+                            size: std::num::NonZeroU64::new(draw.params_binding),
+                        }),
+                    }],
+                }));
+                idx
+            };
+            (frame_idx, params_idx)
         };
         let mut binds: Vec<Binds> = Vec::with_capacity(self.draws.len());
         for draw in &self.draws {
             let entry = match &draw.kind {
                 ArenaKind::Line(p) => {
-                    let (frame_idx, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
-                    Binds { frame_idx, params, texture_idx: None }
+                    let (frame_idx, params_idx) = make(&p.frame_uniforms_layout, &p.draw_params_layout, 0, draw);
+                    Binds { frame_idx, params_idx, texture_idx: None }
                 }
                 ArenaKind::Point(p) => {
-                    let (frame_idx, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
-                    Binds { frame_idx, params, texture_idx: None }
+                    let (frame_idx, params_idx) = make(&p.frame_uniforms_layout, &p.draw_params_layout, 0, draw);
+                    Binds { frame_idx, params_idx, texture_idx: None }
                 }
                 ArenaKind::Tile(p, view, sampler) => {
-                    let (frame_idx, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
+                    let (frame_idx, params_idx) = make(&p.frame_uniforms_layout, &p.draw_params_layout, 1, draw);
                     let key = (
                         &p.texture_layout as *const wgpu::BindGroupLayout as usize,
                         *view as *const wgpu::TextureView as usize,
@@ -2312,10 +2554,10 @@ impl<'a> DrawArena<'a> {
                         }));
                         idx
                     });
-                    Binds { frame_idx, params, texture_idx: Some(tex_idx) }
+                    Binds { frame_idx, params_idx, texture_idx: Some(tex_idx) }
                 }
                 ArenaKind::Gouraud(p, view, sampler) => {
-                    let (frame_idx, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
+                    let (frame_idx, params_idx) = make(&p.frame_uniforms_layout, &p.draw_params_layout, 2, draw);
                     let key = (
                         &p.texture_layout as *const wgpu::BindGroupLayout as usize,
                         *view as *const wgpu::TextureView as usize,
@@ -2333,10 +2575,10 @@ impl<'a> DrawArena<'a> {
                         }));
                         idx
                     });
-                    Binds { frame_idx, params, texture_idx: Some(tex_idx) }
+                    Binds { frame_idx, params_idx, texture_idx: Some(tex_idx) }
                 }
                 ArenaKind::Complex(p, t) => {
-                    let (frame_idx, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
+                    let (frame_idx, params_idx) = make(&p.frame_uniforms_layout, &p.draw_params_layout, 3, draw);
                     let key = (
                         &p.texture_layout as *const wgpu::BindGroupLayout as usize,
                         [
@@ -2364,29 +2606,32 @@ impl<'a> DrawArena<'a> {
                         }));
                         idx
                     });
-                    Binds { frame_idx, params, texture_idx: Some(tex_idx) }
+                    Binds { frame_idx, params_idx, texture_idx: Some(tex_idx) }
                 }
             };
             binds.push(entry);
         }
 
+        let color_store = if discard_color { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store };
+        let depth_store = if discard_depth { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("draw.rs batched render pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                resolve_target,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: color_store },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_target,
-                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: depth_store }),
                 stencil_ops: None,
             }),
             ..Default::default()
         });
         let mut last_pipeline: Option<usize> = None;
         let mut last_frame_idx: Option<usize> = None;
+        let mut last_params_idx: Option<usize> = None;
         let mut last_tex_idx: Option<usize> = None;
         for (draw, binds) in self.draws.iter().zip(&binds) {
             let pipeline = match &draw.kind {
@@ -2402,13 +2647,17 @@ impl<'a> DrawArena<'a> {
                 last_pipeline = Some(pipeline_ptr);
                 // Auto-derived pipeline layouts invalidate prior bind groups on pipeline switch.
                 last_frame_idx = None;
+                last_params_idx = None;
                 last_tex_idx = None;
             }
             if last_frame_idx != Some(binds.frame_idx) {
                 pass.set_bind_group(0, &frame_bind_groups[binds.frame_idx], &[]);
                 last_frame_idx = Some(binds.frame_idx);
             }
-            pass.set_bind_group(1, &binds.params, &[]);
+            if last_params_idx != Some(binds.params_idx) {
+                pass.set_bind_group(1, &params_bind_groups[binds.params_idx], &[]);
+                last_params_idx = Some(binds.params_idx);
+            }
             if let Some(tex_idx) = binds.texture_idx
                 && last_tex_idx != Some(tex_idx)
             {
@@ -2418,6 +2667,7 @@ impl<'a> DrawArena<'a> {
             pass.set_vertex_buffer(0, vertex_buffer.slice(draw.vertex_offset..draw.vertex_offset + draw.vertex_bytes));
             pass.draw(0..draw.vertex_count, 0..1);
         }
+        true
     }
 }
 

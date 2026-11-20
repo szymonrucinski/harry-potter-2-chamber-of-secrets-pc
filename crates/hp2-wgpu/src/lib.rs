@@ -475,6 +475,7 @@ struct InProgressFrame {
     color_format: wgpu::TextureFormat,
     color_sampleable: bool,
     samples: u32,
+    clear_color: wgpu::Color,
     /// `true` if `get_current_texture` returned `Suboptimal`, not
     /// `Success` -- `unlock_frame` clears `configured_size` for this
     /// case the same way `lock_frame` already does for `Outdated`,
@@ -755,6 +756,11 @@ pub struct RenderLoop {
     /// call for the whole frame sharing a single (wrong, per the
     /// `frame_uniforms_segments` field above) `FrameUniforms` buffer.
     batches: Vec<Batch>,
+    /// Texture `cache_id`s referenced by any draw queued or encoded since the
+    /// last `queue.submit`. Overwriting a resident texture only forces a
+    /// mid-frame flush when its ID is in this set, avoiding costly MSAA pass
+    /// splits on unrelated dynamic lightmap/fogmap/procedural uploads.
+    referenced_texture_ids: std::collections::HashSet<u64>,
     /// One pipeline per `(color format, draw::RenderState)` actually
     /// used, built lazily in `dispatch_batches` (wgpu bakes blend,
     /// color mask and depth state into the pipeline, where XOpenGL
@@ -1007,6 +1013,7 @@ impl RenderLoop {
             counts: FrameCounts::default(),
             frame_uniforms_segments: Vec::new(),
             batches: Vec::new(),
+            referenced_texture_ids: std::collections::HashSet::new(),
             line_pipelines: PipelineCache::new(),
             tile_pipelines: PipelineCache::new(),
             point_pipelines: PipelineCache::new(),
@@ -1619,6 +1626,7 @@ impl RenderLoop {
         };
         // DrawTile passes RemoveOccludeIfSolid=1 (DrawTile.cpp:139).
         let state = draw::RenderState::for_poly_flags(request.poly_flags, true);
+        self.referenced_texture_ids.insert(request.cache_id);
         match self.batches.last_mut() {
             Some(Batch {
                 segment: last_segment,
@@ -1887,6 +1895,7 @@ impl RenderLoop {
         };
         // DrawGouraud passes RemoveOccludeIfSolid=0 (DrawGouraud.cpp:74).
         let state = draw::RenderState::for_poly_flags(request.poly_flags, false);
+        self.referenced_texture_ids.insert(request.cache_id);
         match self.batches.last_mut() {
             Some(Batch {
                 segment: last_segment,
@@ -2069,6 +2078,13 @@ impl RenderLoop {
         };
         // DrawComplex passes RemoveOccludeIfSolid=0 (DrawComplex.cpp:64).
         let state = draw::RenderState::for_poly_flags(request.poly_flags, false);
+        self.referenced_texture_ids.insert(request.diffuse.cache_id);
+        if let Some(id) = light_map_cache_id {
+            self.referenced_texture_ids.insert(id);
+        }
+        if let Some(id) = fog_map_cache_id {
+            self.referenced_texture_ids.insert(id);
+        }
         match self.batches.last_mut() {
             Some(Batch {
                 segment: last_segment,
@@ -2137,14 +2153,17 @@ impl RenderLoop {
     /// `queue_*` method already bails on `self.in_progress.is_none()`)
     /// or nothing is actually queued (`self.batches.is_empty()`).
     fn flush_pending_batches(&mut self, created: &CreatedDevice) {
-        if self.batches.is_empty() {
+        if self.batches.is_empty() && self.referenced_texture_ids.is_empty() {
             return;
         }
         let Some(mut frame) = self.in_progress.take() else {
+            self.referenced_texture_ids.clear();
             return;
         };
         let batches = std::mem::take(&mut self.batches);
-        dispatch_batches(created, self, &mut frame, batches);
+        if !batches.is_empty() {
+            dispatch_batches(created, self, &mut frame, batches);
+        }
         let fresh_encoder =
             created
                 .device
@@ -2155,7 +2174,16 @@ impl RenderLoop {
         created
             .queue
             .submit(std::iter::once(finished_encoder.finish()));
+        self.referenced_texture_ids.clear();
         self.in_progress = Some(frame);
+    }
+
+    /// Flushes and submits pending draws only if `cache_id` has been
+    /// referenced by a queued or encoded draw since the last `queue.submit`.
+    fn flush_for_texture_overwrite(&mut self, created: &CreatedDevice, cache_id: u64) {
+        if self.referenced_texture_ids.contains(&cache_id) {
+            self.flush_pending_batches(created);
+        }
     }
 
     /// Drops the per-device texture cache at the renderer's explicit flush
@@ -2189,9 +2217,7 @@ impl RenderLoop {
         rgba8_bytes: &[u8],
         options: texture::TextureOptions,
     ) {
-        if self.texture_cache.get(cache_id).is_some() {
-            self.flush_pending_batches(created);
-        }
+        self.flush_for_texture_overwrite(created, cache_id);
         self.texture_cache
             .upload_rgba8(created, cache_id, width, height, rgba8_bytes, options);
     }
@@ -2210,9 +2236,7 @@ impl RenderLoop {
         rgba8_bytes: &[u8],
         options: texture::TextureOptions,
     ) {
-        if self.texture_cache.get(cache_id).is_some() {
-            self.flush_pending_batches(created);
-        }
+        self.flush_for_texture_overwrite(created, cache_id);
         self.texture_cache.upload_rgba8_hd(
             created,
             cache_id,
@@ -2254,9 +2278,7 @@ impl RenderLoop {
         mips: &[texture::CompressedMipLevel<'_>],
         options: texture::TextureOptions,
     ) -> bool {
-        if self.texture_cache.get(cache_id).is_some() {
-            self.flush_pending_batches(created);
-        }
+        self.flush_for_texture_overwrite(created, cache_id);
         self.texture_cache
             .upload_compressed(created, cache_id, width, height, mips, options)
             .is_some()
@@ -2810,6 +2832,7 @@ pub fn lock_frame(
     // next one.
     loop_state.frame_uniforms_segments.clear();
     loop_state.batches.clear();
+    loop_state.referenced_texture_ids.clear();
     // XOpenGL reuses the last SetSceneNode projection for 2D draws in frames
     // that never call it (modelviewprojMat, XOpenGL.cpp:1832/1879). Seed the
     // frame's segment from last_scene so those draws are not dropped.
@@ -3046,6 +3069,7 @@ pub fn begin_offscreen_frame(
     loop_state.world_scale_state.begin_frame();
     loop_state.frame_uniforms_segments.clear();
     loop_state.batches.clear();
+    loop_state.referenced_texture_ids.clear();
     // XOpenGL reuses the last SetSceneNode projection for 2D draws in frames
     // that never call it (modelviewprojMat, XOpenGL.cpp:1832/1879). Seed the
     // frame's segment from last_scene so those draws are not dropped.
@@ -3087,6 +3111,7 @@ pub fn begin_offscreen_frame(
         color_format: target.format(),
         color_sampleable: target.usage().contains(wgpu::TextureUsages::TEXTURE_BINDING),
         samples: 1,
+        clear_color,
         suboptimal: false,
     });
 }
@@ -3175,6 +3200,18 @@ fn dispatch_batches(
     frame: &mut InProgressFrame,
     batches: Vec<Batch>,
 ) {
+    dispatch_batches_with_options(created, loop_state, frame, batches, None, false, false);
+}
+
+fn dispatch_batches_with_options(
+    created: &CreatedDevice,
+    loop_state: &mut RenderLoop,
+    frame: &mut InProgressFrame,
+    batches: Vec<Batch>,
+    resolve_target: Option<&wgpu::TextureView>,
+    discard_color: bool,
+    discard_depth: bool,
+) -> bool {
     // Track even mid-frame flushes (for example, texture reuploads). The
     // world-scale fallback must see earlier UI after its batches are gone.
     frame.color_drawn |= batches.iter().any(|batch| batch.state.color_write);
@@ -3553,7 +3590,16 @@ fn dispatch_batches(
             }
         }
     }
-    arena.submit(&created.device, &created.queue, &mut frame.encoder, &frame.view, depth_target);
+    arena.submit_with_options(
+        &created.device,
+        &created.queue,
+        &mut frame.encoder,
+        &frame.view,
+        depth_target,
+        resolve_target,
+        discard_color,
+        discard_depth,
+    )
 }
 
 /// Replaces the per-frame-end half of `UWgpuRenderDevice::Unlock`.
@@ -3613,6 +3659,7 @@ fn dispatch_batches(
 pub fn unlock_frame(created: &CreatedDevice, loop_state: &mut RenderLoop, present: bool) -> bool {
     let Some(mut frame) = loop_state.in_progress.take() else {
         created.queue.submit([]);
+        loop_state.referenced_texture_ids.clear();
         return false;
     };
     loop_state.world_scale_state.finish_frame();
@@ -3633,6 +3680,7 @@ pub fn unlock_frame(created: &CreatedDevice, loop_state: &mut RenderLoop, presen
     created
         .queue
         .submit(std::iter::once(frame.encoder.finish()));
+    loop_state.referenced_texture_ids.clear();
     match frame.presentable {
         FramePresentable::Surface(texture) if present => {
             // XOpenGL.cpp:2829-2831: capture runs after the frame is fully

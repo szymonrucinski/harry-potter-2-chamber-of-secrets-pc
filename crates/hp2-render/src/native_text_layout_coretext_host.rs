@@ -19,6 +19,16 @@ use crate::native_text_layout_coretext::{
     Hp2TextLayoutCoreTextRun, Hp2TextLayoutCoreTextServices,
 };
 use core::ffi::c_void;
+use std::collections::{HashMap, HashSet};
+
+struct CachedFontInfo {
+    postscript: Vec<u8>,
+    descriptor: Vec<u8>,
+    size: f64,
+    matrix: [f64; 6],
+}
+
+const FONT_CACHE_LIMIT: usize = 128;
 
 /// Per-call scratch state threaded through every `Hp2TextLayoutCoreTextServices`
 /// entry as the opaque `ctx`. Replaces the native-call fields that used to
@@ -35,6 +45,14 @@ pub struct Hp2TextLayoutCoreTextScratch {
     indices: Vec<ct::CFIndex>,
     bounds: Vec<ct::CGRect>,
     run: Vec<Hp2TextLayoutCoreTextGlyph>,
+    /// Cached `CTFontRef`s keyed by `(utf16 name, size.to_bits())`, retained by this scratch.
+    named_fonts: Vec<(Vec<u16>, u64, *const c_void)>,
+    /// Cached system `CTFontRef`s keyed by `(bold, size.to_bits())`, retained by this scratch.
+    system_fonts: Vec<(u8, u64, *const c_void)>,
+    /// Pointers retained by `named_fonts` or `system_fonts` (addresses cannot be recycled while cached).
+    cached_font_ptrs: HashSet<usize>,
+    /// Cached `CTFont` metadata for retained handles in `cached_font_ptrs`.
+    font_infos: HashMap<usize, CachedFontInfo>,
 }
 impl Hp2TextLayoutCoreTextScratch {
     pub fn new() -> Self {
@@ -47,6 +65,24 @@ impl Hp2TextLayoutCoreTextScratch {
             indices: Vec::new(),
             bounds: Vec::new(),
             run: Vec::new(),
+            named_fonts: Vec::new(),
+            system_fonts: Vec::new(),
+            cached_font_ptrs: HashSet::new(),
+            font_infos: HashMap::new(),
+        }
+    }
+}
+impl Drop for Hp2TextLayoutCoreTextScratch {
+    fn drop(&mut self) {
+        for &(_, _, raw) in &self.named_fonts {
+            if !raw.is_null() {
+                unsafe { ct::CFRelease(raw) };
+            }
+        }
+        for &(_, _, raw) in &self.system_fonts {
+            if !raw.is_null() {
+                unsafe { ct::CFRelease(raw) };
+            }
         }
     }
 }
@@ -100,11 +136,26 @@ unsafe extern "C" fn retain_leaf(handle: *const c_void) {
     unsafe { ct::CFRetain(handle) };
 }
 unsafe extern "C" fn named_font_leaf(
-    _ctx: *mut c_void,
+    ctx: *mut c_void,
     name: *const u16,
     length: usize,
     size: f64,
 ) -> *const c_void {
+    let size_bits = size.to_bits();
+    if !ctx.is_null() && !name.is_null() {
+        let scratch = unsafe { scratch(ctx) };
+        let slice = unsafe { core::slice::from_raw_parts(name, length) };
+        if let Some(&(_, _, cached)) = scratch
+            .named_fonts
+            .iter()
+            .find(|(n, s, _)| *s == size_bits && n.as_slice() == slice)
+        {
+            if !cached.is_null() {
+                unsafe { ct::CFRetain(cached) };
+            }
+            return cached;
+        }
+    }
     let string =
         unsafe { ct::CFStringCreateWithCharacters(ct::kCFAllocatorDefault, name, length as isize) };
     if string.is_null() {
@@ -112,15 +163,51 @@ unsafe extern "C" fn named_font_leaf(
     }
     let font = unsafe { ct::CTFontCreateWithName(string, size, core::ptr::null()) };
     unsafe { ct::CFRelease(string) };
+    if !ctx.is_null() && !name.is_null() {
+        let scratch = unsafe { scratch(ctx) };
+        if scratch.named_fonts.len() < FONT_CACHE_LIMIT {
+            if !font.is_null() {
+                unsafe { ct::CFRetain(font) };
+                scratch.cached_font_ptrs.insert(font as usize);
+            }
+            let slice = unsafe { core::slice::from_raw_parts(name, length) };
+            scratch.named_fonts.push((slice.to_vec(), size_bits, font));
+        }
+    }
     font
 }
-unsafe extern "C" fn system_font_leaf(_ctx: *mut c_void, bold: u8, size: f64) -> *const c_void {
+unsafe extern "C" fn system_font_leaf(ctx: *mut c_void, bold: u8, size: f64) -> *const c_void {
+    let size_bits = size.to_bits();
+    if !ctx.is_null() {
+        let scratch = unsafe { scratch(ctx) };
+        if let Some(&(_, _, cached)) = scratch
+            .system_fonts
+            .iter()
+            .find(|(b, s, _)| *b == bold && *s == size_bits)
+        {
+            if !cached.is_null() {
+                unsafe { ct::CFRetain(cached) };
+            }
+            return cached;
+        }
+    }
     let ui_type = if bold != 0 {
         ct::K_CT_FONT_UI_FONT_EMPHASIZED_SYSTEM
     } else {
         ct::K_CT_FONT_UI_FONT_SYSTEM
     };
-    unsafe { ct::CTFontCreateUIFontForLanguage(ui_type, size, core::ptr::null()) }
+    let font = unsafe { ct::CTFontCreateUIFontForLanguage(ui_type, size, core::ptr::null()) };
+    if !ctx.is_null() {
+        let scratch = unsafe { scratch(ctx) };
+        if scratch.system_fonts.len() < FONT_CACHE_LIMIT {
+            if !font.is_null() {
+                unsafe { ct::CFRetain(font) };
+                scratch.cached_font_ptrs.insert(font as usize);
+            }
+            scratch.system_fonts.push((bold, size_bits, font));
+        }
+    }
+    font
 }
 unsafe extern "C" fn font_info_leaf(
     ctx: *mut c_void,
@@ -128,6 +215,24 @@ unsafe extern "C" fn font_info_leaf(
     out: *mut Hp2TextLayoutCoreTextFontInfo,
 ) -> u8 {
     let scratch = unsafe { scratch(ctx) };
+    let key = handle as usize;
+    if let Some(cached) = scratch.font_infos.get(&key) {
+        scratch.postscript.clear();
+        scratch.postscript.extend_from_slice(&cached.postscript);
+        scratch.descriptor.clear();
+        scratch.descriptor.extend_from_slice(&cached.descriptor);
+        unsafe {
+            *out = Hp2TextLayoutCoreTextFontInfo {
+                postscript: scratch.postscript.as_ptr(),
+                postscript_len: scratch.postscript.len(),
+                descriptor: scratch.descriptor.as_ptr(),
+                descriptor_len: scratch.descriptor.len(),
+                size: cached.size,
+                matrix: cached.matrix,
+            };
+        }
+        return 1;
+    }
     let descriptor = unsafe { ct::CTFontCopyFontDescriptor(handle) };
     let name = if !descriptor.is_null() {
         unsafe { ct::CTFontDescriptorCopyAttribute(descriptor, ct::kCTFontNameAttribute) }
@@ -154,6 +259,18 @@ unsafe extern "C" fn font_info_leaf(
     if !postscript.is_null() {
         unsafe { ct::CFRelease(postscript) };
     }
+    let matrix_arr = [matrix.a, matrix.b, matrix.c, matrix.d, matrix.tx, matrix.ty];
+    if scratch.cached_font_ptrs.contains(&key) {
+        scratch.font_infos.insert(
+            key,
+            CachedFontInfo {
+                postscript: scratch.postscript.clone(),
+                descriptor: scratch.descriptor.clone(),
+                size,
+                matrix: matrix_arr,
+            },
+        );
+    }
     unsafe {
         *out = Hp2TextLayoutCoreTextFontInfo {
             postscript: scratch.postscript.as_ptr(),
@@ -161,7 +278,7 @@ unsafe extern "C" fn font_info_leaf(
             descriptor: scratch.descriptor.as_ptr(),
             descriptor_len: scratch.descriptor.len(),
             size,
-            matrix: [matrix.a, matrix.b, matrix.c, matrix.d, matrix.tx, matrix.ty],
+            matrix: matrix_arr,
         };
     }
     1
