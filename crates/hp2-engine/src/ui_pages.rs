@@ -7,14 +7,15 @@ use std::{cell::RefCell, collections::HashMap, ffi::c_void, rc::Rc};
 use hp2_abi::engine::generated::{UFunction, UObject};
 use hp2_core::{core_access::{CoreAccess, RuntimeError, RuntimeResult}, name_owner::FindName};
 use hp2_ui::{
-    Align, BlendMode, Color, Edges, Fit, Font, Justify, Key, PointerButton, PopupMetrics, Signal, Size, Skin, SkinPart, SliderMetrics, Store, Style, Stylesheet, TextureRef, Ui,
+    Align, BlendMode, Color, Edges, Fit, Font, Justify, Key, PointerButton, PopupMetrics, Signal, Size, Skin, SkinPart, SliderMetrics, Store, Style, Stylesheet, TextAlign, TextureRef, Ui,
     button, checkbox, col, image, label, row, select, slider,
 };
 
 use crate::{
     stock_graphics_menu::{boolean, children, field, live, object, prop, read_boolean, set_text, text, Weak},
+    ui_console_views::declared,
     ui_host::{class_name_of, find_class, find_texture, name_of, read_string, HostMetrics, Surface},
-    ui_vm::{invoke, V},
+    ui_vm::{invoke, invoke_resolved, V},
 };
 
 const PAGE_CLASS: &str = "FESoundVideoPage";
@@ -26,6 +27,7 @@ const IVORY: Color = Color(255, 248, 226, 255);
 const HINT_PARCHMENT: Color = Color(188, 176, 148, 255);
 const VELVET_HEADER: Color = Color(245, 245, 255, 255);
 const VELVET_CARD: Color = Color(186, 192, 220, 255);
+const RULE_GOLD: Color = Color(235, 220, 180, 255);
 const FALLBACK_VELVET: Color = Color(26, 33, 68, 255);
 const FALLBACK_GOLD: Color = Color(196, 152, 66, 255);
 const FALLBACK_GOLD_DARK: Color = Color(98, 70, 22, 255);
@@ -176,11 +178,129 @@ fn extra_options() -> Vec<ExtraOption> {
     ]
 }
 
+// ---- language ----------------------------------------------------------------------------------
+
+/// Whether `[Engine.Engine] Language` is Polish (`pol`, any case).
+fn polish_language(a: CoreAccess<'_>) -> bool {
+    a.language_text().is_ok_and(|units| {
+        units.iter().take_while(|&&u| u != 0).filter_map(|&u| char::from_u32(u)).collect::<String>().eq_ignore_ascii_case("pol")
+    })
+}
+
+/// The Polish wording of every caption and value this view draws, in the register of the
+/// Polish *Harry Potter i Komnata Tajemnic* menus. Each fits its column: captions <= 18
+/// characters (141-unit caption column), combo values <= 12 (the 114-unit value field of a
+/// 133-unit box), checkbox captions <= 14 (125-unit cells). Words that read the same in Polish
+/// ("HDR", "Gamepad", "Monitor", "4x", "60 FPS") have no entry.
+fn polish(english: &str) -> Option<&'static str> {
+    Some(match english {
+        // Pages, panels and navigation.
+        "Sound & Video" => "Dźwięk i obraz",
+        "More Options" => "Więcej opcji",
+        "More Options >" => "Więcej opcji >",
+        "< Sound & Video" => "< Dźwięk i obraz",
+        "Video" => "Obraz",
+        "Audio & Display" => "Dźwięk i ekran",
+        "Advanced Graphics" => "Zaawansowana grafika",
+        "World & Controls" => "Świat i sterowanie",
+        "Display & Accessibility" => "Ekran i dostępność",
+        "Hogwarts Graphics & Accessibility" => "Grafika i dostępność",
+        "HD Textures and enhancements apply immediately as you toggle them." => "Tekstury HD i efekty działają od razu po przełączeniu.",
+        // Sound & Video captions.
+        "Logical res." => "Rozdzielczość",
+        "Textures" => "Szczegóły tekstur",
+        "Object Detail" => "Szczegóły obiektów",
+        "Brightness" => "Jasność",
+        "3D Scale" => "Skala 3D",
+        "Music" => "Muzyka",
+        "Sound" => "Dźwięk",
+        "Display" => "Tryb ekranu",
+        "Show FPS" => "Pokaż FPS",
+        "Low" => "Niska",
+        "High" => "Wysoka",
+        // `stock_graphics_menu` rows and `QUALITY_CAPTIONS`.
+        "Frame limit" => "Limit klatek",
+        "VSync" => "Synchr. pionowa",
+        "Anti-alias" => "Antyaliasing",
+        "Anisotropy" => "Filtr anizotropowy",
+        "UI scale" => "Skala interfejsu",
+        "Vertical FOV" => "Pionowy FOV",
+        "Flashes" => "Błyski",
+        "Mipmaps" => "Mipmapy",
+        "Edge AA" => "AA krawędzi",
+        "Light filter" => "Filtr światła",
+        "Bloom" => "Poświata",
+        "Soft shadows" => "Miękkie cienie",
+        "Rich color" => "Żywe kolory",
+        "Sharpen" => "Wyostrzanie",
+        "Smooth edges" => "Wygładzanie",
+        "Full detail" => "Pełne detale",
+        "Fog" => "Mgła",
+        // More Options captions.
+        "HD Textures" => "Tekstury HD",
+        "Draw Distance" => "Zasięg rysowania",
+        "Voice Volume" => "Głośność mowy",
+        "Sound in background" => "Dźwięk w tle",
+        "Mouse left/right" => "Mysz poziomo",
+        "Mouse up/down" => "Mysz pionowo",
+        "Raw mouse" => "Surowa mysz",
+        "Gamepad look" => "Czułość pada",
+        "HUD size" => "Rozmiar HUD",
+        "Fullscreen style" => "Pełny ekran",
+        "Subtitle size" => "Rozmiar napisów",
+        "Always subtitles" => "Zawsze napisy",
+        "Colour-blind HUD" => "Tryb daltonistów",
+        // Values.
+        "On" => "Wł.",
+        "Off" => "Wył.",
+        "Unlimited" => "Bez limitu",
+        "Adaptive" => "Adaptacyjna",
+        "Original" => "Oryginalny",
+        "Windowed" => "Okno",
+        "Fullscreen (exclusive)" => "Pełny ekran",
+        "Borderless Fullscreen" => "Bez ramki",
+        "Exclusive" => "Wyłączny",
+        "Borderless" => "Bez ramki",
+        _ => return None,
+    })
+}
+
+/// How a caption or value reads on screen. The canonical English strings stay the internal
+/// values (stock combo text, `Command::PickText`, config); only the drawn text changes. The two
+/// long display-mode names are shortened in English too so they fit their combo box.
+fn shown(polish_ui: bool, english: &str) -> String {
+    if polish_ui {
+        if let Some(text) = polish(english) {
+            return text.to_owned();
+        }
+        if let Some(n) = english.strip_prefix("Display ") {
+            return format!("Ekran {n}");
+        }
+    }
+    match english {
+        "Fullscreen (exclusive)" => "Fullscreen",
+        "Borderless Fullscreen" => "Borderless",
+        other => other,
+    }
+    .to_owned()
+}
+
+// ---- state -------------------------------------------------------------------------------------
 
 struct AdvancedRow {
     caption: &'static str,
     options: Vec<String>,
     current: Signal<String>,
+}
+
+/// Which `HP2_Menu` art is resident, texture by texture, so one missing piece only drops itself:
+/// the velvet toolbar needs its three slices, each icon stands alone.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct MenuArt {
+    toolbar: bool,
+    eye: bool,
+    scroll: bool,
+    crest: bool,
 }
 
 /// The view's state: signals mirrored from the stock controls plus the pending commands.
@@ -201,14 +321,16 @@ struct Data {
     advanced: Vec<AdvancedRow>,
     /// The "More options" panel is shown instead of the Video/Audio panel.
     more: Signal<bool>,
-    /// True when the main-menu `HP2_Menu` gilded velvet toolbar & crest textures are loaded.
-    has_menu_art: bool,
+    /// The main-menu `HP2_Menu` art that is loaded (checked every paint).
+    art: Signal<MenuArt>,
+    /// `[Engine.Engine] Language=pol`: draw Polish captions and values.
+    polish: bool,
     extras: Vec<(ExtraOption, Signal<f32>)>,
     queue: Rc<RefCell<Vec<Command>>>,
 }
 
 impl Data {
-    fn new(store: &Store, has_menu_art: bool) -> Rc<Self> {
+    fn new(store: &Store, polish: bool) -> Rc<Self> {
         let advanced = crate::stock_graphics_menu::advanced_rows()
             .into_iter()
             .map(|(caption, options)| AdvancedRow { caption, options: options.into_iter().map(str::to_owned).collect(), current: store.signal(String::new()) })
@@ -229,10 +351,16 @@ impl Data {
             quality: std::array::from_fn(|_| store.signal(false)),
             advanced,
             more: store.signal(false),
-            has_menu_art,
+            art: store.signal(MenuArt::default()),
+            polish,
             extras: extra_options().into_iter().map(|o| (o, store.signal(0.))).collect(),
             queue: Rc::new(RefCell::new(Vec::new())),
         })
+    }
+
+    /// The on-screen wording of `english` (see [`shown`]).
+    fn tr(&self, english: &str) -> String {
+        shown(self.polish, english)
     }
 }
 
@@ -241,7 +369,6 @@ fn stylesheet() -> Stylesheet {
         .with("page-title", Style { color: GOLD_TITLE, font: Font::Slot(4), ..Style::default() })
         .with("header", Style { color: GOLD_SECTION, font: Font::Slot(5), ..Style::default() })
         .with("caption", Style { color: PARCHMENT, font: Font::Bold, ..Style::default() })
-        .with("small-caption", Style { color: PARCHMENT, font: Font::Normal, ..Style::default() })
         .with("hint", Style { color: HINT_PARCHMENT, font: Font::Normal, ..Style::default() })
         .with("nav-btn", Style { color: IVORY, font: Font::Bold, ..Style::default() })
         .with("footer-title", Style { color: GOLD_SECTION, font: Font::Bold, ..Style::default() })
@@ -286,94 +413,172 @@ fn scale_slider(page: *mut UObject) -> Option<*mut UObject> { crate::stock_rende
 #[cfg(not(feature = "renderer-wgpu"))]
 fn scale_slider(_: *mut UObject) -> Option<*mut UObject> { None }
 
-// ---- the view ----------------------------------------------------------------------------
+// ---- the view ----------------------------------------------------------------------------------
+//
+// One grid on the 640x480 page (page units). The stock Back button stays at (582, 422, 48, 48),
+// and the engine's FPS counter sits in the screen's top-right corner, so the header and footer
+// strips stop at x = 574 and every card ends at y <= 412:
+//
+//   header   x 12..574  y  10..48    (gilded velvet bar: icon, title, panel switch)
+//   cards    x 12..316 / 324..628    y  54..244   (Sound & Video)  |  y 54..412 (More Options)
+//   advanced x 12..628  y 250..412
+//   footer   x 12..574  y 418..472   (Back button: x 582..630, y 422..470)
+//
+// Inside a card: 4-unit gilded rail, title at y 5..22, gold rule block 22..30, rows from y 30.
+// Video rows 25 + 25 + 38 + 38 + 25 = 151 -> 30..181 (inner edge 186); Audio rows
+// 38 + 38 + 8 + 25 + 24 + 4 gaps of 4 = 149 -> 30..179; Advanced 5 x 25 = 125 -> 30..155
+// (inner edge 158); More Options 8 x 39 = 312 -> 30..342 (inner edge 354). A slider row is the
+// 24-unit slider, a 1-unit gap and a 12-unit hint line (37 of 38), so hints never reach the
+// next control.
 
+const MARGIN: f32 = 12.;
+/// Width of the header and footer strips (x 12..574, clear of the Back button and FPS counter).
+const STRIP_W: f32 = 562.;
+const HEADER_Y: f32 = 10.;
+const HEADER_H: f32 = 38.;
+const CARD_Y: f32 = 54.;
+const CARD_W: f32 = 304.;
+const RIGHT_CARD_X: f32 = 324.;
+const WIDE_W: f32 = 616.;
+const TOP_CARD_H: f32 = 190.;
+const ADVANCED_Y: f32 = 250.;
+const ADVANCED_H: f32 = 162.;
+const TALL_CARD_H: f32 = 358.;
+const FOOTER_Y: f32 = 418.;
+const FOOTER_H: f32 = 54.;
+const RAIL: f32 = 4.;
+/// Inner horizontal padding of a card; leaves `COLUMN_W` for a 304-unit card.
+const CARD_PAD: f32 = 12.;
 const COLUMN_W: f32 = 280.;
+/// Every combo box and slider shares the slider art's width so controls lock onto one grid.
+const ART_W: f32 = 133.;
+/// Caption column left of a control, with a 6-unit gutter.
+const CAPTION_W: f32 = COLUMN_W - ART_W - 6.;
+const WIDGET_H: f32 = 24.;
+const HINT_H: f32 = 12.;
+const COMBO_ROW_H: f32 = 25.;
+const SLIDER_ROW_H: f32 = WIDGET_H + 1. + HINT_H + 1.;
+const EXTRA_ROW_H: f32 = 39.;
+const CHECK_ROW_H: f32 = 20.;
+const CREST_W: f32 = 26.;
+/// Footer content width (inside the 12-unit padding) and the 4-column checkbox grid beside the crest.
+const FOOTER_INNER_W: f32 = STRIP_W - 2. * CARD_PAD;
+const EFFECT_W: f32 = (FOOTER_INNER_W - CREST_W - 10.) / 4.;
+
 /// Captions for `render_device_owner::QUALITY_KEYS`, in that order. The first three are
-/// On/Off rows under Advanced; the rest are the "Enhancements" checkboxes.
+/// On/Off rows under Advanced; the rest are the footer checkboxes.
 const QUALITY_CAPTIONS: [&str; crate::render_device_owner::QUALITY_COUNT] =
     ["Mipmaps", "Edge AA", "Light filter", "Bloom", "Soft shadows", "Rich color", "Sharpen", "Smooth edges", "Full detail", "HDR", "Fog"];
 const QUALITY_ROWS: usize = 3;
-/// Every combo box and slider shares the exact same width so controls lock onto one vertical grid.
-const ART_W: f32 = 133.;
-const EFFECT_ROW_H: f32 = 21.;
-/// Width of every "More options" control (the slider art width), so they line up.
-const EXTRA_BOX_W: f32 = ART_W;
-/// Advanced rows are compact so the Enhancements checkboxes stay clear of the Back button.
-const ADVANCED_ROW_H: f32 = 23.;
 
-/// 9-slice royal-indigo velvet panel framed with the main menu's gilded antique-gold bevel.
-fn gilded_panel(x: f32, y: f32, w: f32, h: f32, border: f32, tint: Color, has_art: bool) -> hp2_ui::Node {
-    let mut panel = col().at(x, y).width(Size::Px(w)).height(Size::Px(h));
+fn px(v: f32) -> Size {
+    Size::Px(v)
+}
+
+/// 9-slice royal-indigo velvet panel framed with the main menu's gilded antique-gold bevel
+/// (`HP2TopToolbar*`: rails are rows 0..11 and 86..97, sides columns 0..11 and 117..128).
+fn gilded_panel(w: f32, h: f32, border: f32, tint: Color, has_art: bool) -> hp2_ui::Node {
+    let panel = col().at(0., 0.).width(px(w)).height(px(h));
     if !has_art {
         return panel
             .background(FALLBACK_GOLD_DARK)
-            .child(col().at(1., 1.).width(Size::Px(w - 2.)).height(Size::Px(h - 2.)).background(FALLBACK_GOLD))
-            .child(col().at(border, border).width(Size::Px((w - 2. * border).max(0.))).height(Size::Px((h - 2. * border).max(0.))).background(FALLBACK_VELVET));
+            .child(col().at(1., 1.).width(px(w - 2.)).height(px(h - 2.)).background(FALLBACK_GOLD))
+            .child(col().at(border, border).width(px((w - 2. * border).max(0.))).height(px((h - 2. * border).max(0.))).background(FALLBACK_VELVET));
     }
     let b = border;
     let iw = (w - 2. * b).max(0.);
     let ih = (h - 2. * b).max(0.);
-    let piece = |tex: &str, region: (f32, f32, f32, f32), px: f32, py: f32, pw: f32, ph: f32, color: Color| {
+    let piece = |tex: &str, region: (f32, f32, f32, f32), at: (f32, f32), size: (f32, f32), color: Color| {
         image(TextureRef(tex.to_owned()), Fit::Region(region.0, region.1, region.2, region.3))
-            .at(px, py)
-            .width(Size::Px(pw))
-            .height(Size::Px(ph))
+            .at(at.0, at.1)
+            .width(px(size.0))
+            .height(px(size.1))
             .color(color)
             .blend(BlendMode::Masked)
     };
-    // Royal velvet interior
-    panel = panel.child(piece(TEX_BAR_MID, (0., 11., 256., 75.), b, b, iw, ih, tint));
-    // Four beveled antique-gold rails
-    panel = panel.child(piece(TEX_BAR_MID, (0., 0., 256., 11.), b, 0., iw, b, Color::WHITE));
-    panel = panel.child(piece(TEX_BAR_MID, (0., 86., 256., 11.), b, h - b, iw, b, Color::WHITE));
-    panel = panel.child(piece(TEX_BAR_LEFT, (0., 11., 11., 75.), 0., b, b, ih, Color::WHITE));
-    panel = panel.child(piece(TEX_BAR_RIGHT, (117., 11., 11., 75.), w - b, b, b, ih, Color::WHITE));
-    // Four gilded corners
-    panel = panel.child(piece(TEX_BAR_LEFT, (0., 0., 11., 11.), 0., 0., b, b, Color::WHITE));
-    panel = panel.child(piece(TEX_BAR_LEFT, (0., 86., 11., 11.), 0., h - b, b, b, Color::WHITE));
-    panel = panel.child(piece(TEX_BAR_RIGHT, (117., 0., 11., 11.), w - b, 0., b, b, Color::WHITE));
-    panel = panel.child(piece(TEX_BAR_RIGHT, (117., 86., 11., 11.), w - b, h - b, b, b, Color::WHITE));
     panel
+        // Velvet interior, then the four rails and four corners.
+        .child(piece(TEX_BAR_MID, (0., 11., 256., 75.), (b, b), (iw, ih), tint))
+        .child(piece(TEX_BAR_MID, (0., 0., 256., 11.), (b, 0.), (iw, b), Color::WHITE))
+        .child(piece(TEX_BAR_MID, (0., 86., 256., 11.), (b, h - b), (iw, b), Color::WHITE))
+        .child(piece(TEX_BAR_LEFT, (0., 11., 11., 75.), (0., b), (b, ih), Color::WHITE))
+        .child(piece(TEX_BAR_RIGHT, (117., 11., 11., 75.), (w - b, b), (b, ih), Color::WHITE))
+        .child(piece(TEX_BAR_LEFT, (0., 0., 11., 11.), (0., 0.), (b, b), Color::WHITE))
+        .child(piece(TEX_BAR_LEFT, (0., 86., 11., 11.), (0., h - b), (b, b), Color::WHITE))
+        .child(piece(TEX_BAR_RIGHT, (117., 0., 11., 11.), (w - b, 0.), (b, b), Color::WHITE))
+        .child(piece(TEX_BAR_RIGHT, (117., 86., 11., 11.), (w - b, h - b), (b, b), Color::WHITE))
 }
 
-/// Slender burnished-gold horizontal rule separating a card's title from its controls.
+/// Slender burnished-gold rule (the toolbar's own gilded rail when the art is loaded).
 fn gold_rule(w: f32, has_art: bool) -> hp2_ui::Node {
     if has_art {
         image(TextureRef(TEX_BAR_MID.to_owned()), Fit::Region(0., 0., 256., 11.))
-            .width(Size::Px(w))
-            .height(Size::Px(2.5))
-            .color(Color(235, 220, 180, 255))
+            .width(px(w))
+            .height(px(2.))
+            .color(RULE_GOLD)
             .blend(BlendMode::Masked)
     } else {
-        col().width(Size::Px(w)).height(Size::Px(1.5)).background(FALLBACK_GOLD)
+        col().width(px(w)).height(px(2.)).background(FALLBACK_GOLD)
     }
 }
 
-/// Ornate top Hogwarts banner matching the main menu's gilded toolbar.
-fn header_bar(d: &Rc<Data>, title: &str, icon_tex: &str, icon_region: (f32, f32, f32, f32), icon_size: (f32, f32)) -> hp2_ui::Node {
-    let mut bar = col().at(12., 6.).width(Size::Px(616.)).height(Size::Px(44.));
-    bar = bar.child(gilded_panel(0., 0., 616., 44., 5., VELVET_HEADER, d.has_menu_art));
-    let mut left = row().align(Align::Center).gap(10.);
-    if d.has_menu_art {
-        left = left.child(
-            image(TextureRef(icon_tex.to_owned()), Fit::Region(icon_region.0, icon_region.1, icon_region.2, icon_region.3))
-                .width(Size::Px(icon_size.0))
-                .height(Size::Px(icon_size.1))
-                .color(Color::WHITE)
-                .blend(BlendMode::Masked),
-        );
-    }
-    left = left.child(label(title).class("page-title").height(Size::Px(30.)));
-    bar.child(
-        row()
-            .at(14., 7.)
-            .width(Size::Px(588.))
-            .height(Size::Px(30.))
-            .align(Align::Center)
-            .justify(Justify::SpaceBetween)
-            .child(left)
-            .child(panel_switch(d)),
+/// A 3-unit gap, the rule, a 3-unit gap: 8 units.
+fn rule_block(w: f32, has_art: bool) -> hp2_ui::Node {
+    col().padding(Edges { top: 3., bottom: 3., ..Edges::default() }).child(gold_rule(w, has_art))
+}
+
+/// A gilded card at `(x, y)`: title, rule, then `body` from y = 30.
+fn card(d: &Data, (x, y, w, h): (f32, f32, f32, f32), title: &str, body: hp2_ui::Node) -> hp2_ui::Node {
+    let toolbar = d.art.get().toolbar;
+    let inner = w - 2. * CARD_PAD;
+    col()
+        .at(x, y)
+        .width(px(w))
+        .height(px(h))
+        .child(gilded_panel(w, h, RAIL, VELVET_CARD, toolbar))
+        .child(
+            col()
+                .at(CARD_PAD, 5.)
+                .width(px(inner))
+                .child(label(&d.tr(title)).class("header").width(px(inner)).height(px(17.)))
+                .child(rule_block(inner, toolbar))
+                .child(body),
+        )
+}
+
+/// A gilded strip (header or footer) at `(x, y)` holding `content` inside its 12-unit padding.
+fn strip(d: &Data, y: f32, h: f32, tint: Color, content: hp2_ui::Node) -> hp2_ui::Node {
+    col()
+        .at(MARGIN, y)
+        .width(px(STRIP_W))
+        .height(px(h))
+        .child(gilded_panel(STRIP_W, h, 5., tint, d.art.get().toolbar))
+        .child(content.at(CARD_PAD, 5.).width(px(FOOTER_INNER_W)).height(px(h - 10.)))
+}
+
+/// The page's crest/icon art (`Fit::Region` of the visible part of a 64x64 icon).
+fn icon(texture: &str, region: (f32, f32, f32, f32), size: (f32, f32)) -> hp2_ui::Node {
+    image(TextureRef(texture.to_owned()), Fit::Region(region.0, region.1, region.2, region.3))
+        .width(px(size.0))
+        .height(px(size.1))
+        .color(Color::WHITE)
+        .blend(BlendMode::Masked)
+}
+
+/// Ornate header bar matching the main menu's gilded toolbar: icon and title left, the
+/// panel switch right.
+fn header_bar(d: &Rc<Data>, title: &str, art_icon: Option<hp2_ui::Node>) -> hp2_ui::Node {
+    let left = row()
+        .align(Align::Center)
+        .gap(8.)
+        .children(art_icon)
+        .child(label(&d.tr(title)).class("page-title").height(px(28.)));
+    strip(
+        d,
+        HEADER_Y,
+        HEADER_H,
+        VELVET_HEADER,
+        row().align(Align::Center).justify(Justify::SpaceBetween).child(left).child(panel_switch(d)),
     )
 }
 
@@ -390,313 +595,301 @@ fn slider_node(d: &Rc<Data>, ctl: Ctl, min: f32, max: f32, signal: &Signal<f32>)
     .key(&key_of(ctl))
 }
 
+/// A combo over `options` (canonical strings). The box shows translated text; every pick
+/// still sends the canonical string or index, so the stock handlers see exactly what they expect.
 fn select_node(d: &Rc<Data>, ctl: Ctl, current: &Signal<String>, options: &[String], by_index: bool) -> hp2_ui::Node {
     let now = current.get();
-    let mut shown: Vec<String> = options.to_vec();
+    let mut canonical: Vec<String> = options.to_vec();
     // A value the stock page reports that is not one of the choices (for example "Custom") is shown, not hidden.
-    let selected = shown.iter().position(|o| *o == now).unwrap_or_else(|| {
-        shown.push(now.clone());
-        shown.len() - 1
+    let selected = canonical.iter().position(|o| *o == now).unwrap_or_else(|| {
+        canonical.push(now.clone());
+        canonical.len() - 1
     });
+    let labels: Vec<String> = canonical.iter().map(|o| d.tr(o)).collect();
     let (queue, signal, choices) = (d.queue.clone(), current.clone(), options.to_vec());
-    select(&shown, selected, move |i| {
+    select(&labels, selected, move |i| {
         let Some(choice) = choices.get(i) else { return };
         signal.set(choice.clone());
         queue.borrow_mut().push(if by_index { Command::PickIndex(ctl, i) } else { Command::PickText(ctl, choice.clone()) });
     })
     .key(&key_of(ctl))
-    .width(Size::Px(ART_W))
+    .width(px(ART_W))
     .color(IVORY)
     .font(Font::Bold)
 }
 
-/// Left-aligned warm parchment caption + right-aligned bronze combo box on one crisp grid.
-fn combo_row(caption: &str, select_node: hp2_ui::Node, height: f32) -> hp2_ui::Node {
+/// A caption in the left column; its box is as tall as a control so the text centres on it.
+fn caption(text: &str) -> hp2_ui::Node {
+    label(text).class("caption").width(px(CAPTION_W)).height(px(WIDGET_H))
+}
+
+/// Caption left, combo box right, both on the row's centre line.
+fn combo_row(text: &str, select_node: hp2_ui::Node, height: f32) -> hp2_ui::Node {
     row()
-        .width(Size::Px(COLUMN_W))
-        .height(Size::Px(height))
+        .width(px(COLUMN_W))
+        .height(px(height))
         .align(Align::Center)
         .justify(Justify::SpaceBetween)
-        .child(label(caption).class("caption").height(Size::Px(22.)))
+        .child(caption(text))
         .child(select_node)
 }
 
-/// Left-aligned parchment caption + right-aligned emerald/gold slider with Low/High hints.
-fn slider_row(caption: &str, slider_node: hp2_ui::Node, height: f32) -> hp2_ui::Node {
-    let hints = row().width(Size::Px(ART_W)).justify(Justify::SpaceBetween).child(label("Low").class("hint")).child(label("High").class("hint"));
+/// A control column: the 24-unit control with a 12-unit hint line under it.
+fn with_hints(control: hp2_ui::Node, left: hp2_ui::Node, right: hp2_ui::Node) -> hp2_ui::Node {
+    col()
+        .width(px(ART_W))
+        .gap(1.)
+        .child(control)
+        .child(row().width(px(ART_W)).height(px(HINT_H)).child(left).child(right))
+}
+
+fn hint(text: &str, width: f32, align: TextAlign) -> hp2_ui::Node {
+    label(text).class("hint").width(px(width)).height(px(HINT_H)).text_align(align)
+}
+
+/// Caption left (centred on the slider), slider right with its Low/High hints under the ends.
+fn slider_row(d: &Data, text: &str, slider_node: hp2_ui::Node) -> hp2_ui::Node {
+    let half = ART_W / 2.;
     row()
-        .width(Size::Px(COLUMN_W))
-        .height(Size::Px(height))
+        .width(px(COLUMN_W))
+        .height(px(SLIDER_ROW_H))
         .justify(Justify::SpaceBetween)
-        .child(label(caption).class("caption").height(Size::Px(22.)).padding(Edges { top: 2., ..Edges::default() }))
-        .child(col().width(Size::Px(ART_W)).gap(1.).child(slider_node).child(hints))
+        .child(caption(text))
+        .child(with_hints(slider_node, hint(&d.tr("Low"), half, TextAlign::Left), hint(&d.tr("High"), half, TextAlign::Right)))
 }
 
 /// The gilded bronze button that flips between the Sound & Video and More Options panels.
 fn panel_switch(d: &Rc<Data>) -> hp2_ui::Node {
     let more = d.more.clone();
-    let caption = if more.get() { "< Sound & Video" } else { "More Options >" };
-    button(caption)
+    let caption = d.tr(if more.get() { "< Sound & Video" } else { "More Options >" });
+    button(&caption)
         .key("PanelSwitch")
         .class("nav-btn")
-        .width(Size::Px(148.))
-        .height(Size::Px(24.))
+        .width(px(148.))
+        .height(px(WIDGET_H))
         .on_click(move || more.set(!more.get()))
 }
 
 fn extras_view(d: &Rc<Data>) -> hp2_ui::Node {
+    let art = d.art.get();
     let mut rows: Vec<hp2_ui::Node> = d.extras.iter().enumerate().map(|(i, (option, value))| {
         let (queue, signal) = (d.queue.clone(), value.clone());
-        let node = match &option.kind {
+        let key = format!("Extra{i}");
+        let control = match &option.kind {
             ExtraKind::Toggle => {
-                let options = ["On".to_owned(), "Off".to_owned()];
-                select(&options, usize::from(value.get() < 0.5), move |choice| {
+                let labels = [d.tr("On"), d.tr("Off")];
+                select(&labels, usize::from(value.get() < 0.5), move |choice| {
                     let v = if choice == 0 { 1. } else { 0. };
                     signal.set(v);
                     queue.borrow_mut().push(Command::Extra(i, v));
                 })
+                .key(&key)
                 .color(IVORY)
                 .font(Font::Bold)
-                .width(Size::Px(ART_W))
+                .width(px(ART_W))
             }
             ExtraKind::Choice(options) => {
+                let labels: Vec<String> = options.iter().map(|o| d.tr(o)).collect();
                 let selected = (value.get().max(0.) as usize).min(options.len().saturating_sub(1));
-                select(options, selected, move |choice| {
+                select(&labels, selected, move |choice| {
                     signal.set(choice as f32);
                     queue.borrow_mut().push(Command::Extra(i, choice as f32));
                 })
+                .key(&key)
                 .color(IVORY)
                 .font(Font::Bold)
-                .width(Size::Px(ART_W))
+                .width(px(ART_W))
             }
-            ExtraKind::Range { min, max, step, .. } => slider(*min, *max, *step, value.get(), move |v| {
-                signal.set(v);
-                queue.borrow_mut().push(Command::Extra(i, v));
-            }),
+            // The value sits centred under the slider, so long captions never collide with it.
+            ExtraKind::Range { min, max, step, unit } => with_hints(
+                slider(*min, *max, *step, value.get(), move |v| {
+                    signal.set(v);
+                    queue.borrow_mut().push(Command::Extra(i, v));
+                })
+                .key(&key),
+                hint(&format!("{}{unit}", value.get().round() as i32), ART_W, TextAlign::Center),
+                row(),
+            ),
         };
-        let caption = match &option.kind {
-            ExtraKind::Range { unit, .. } => format!("{} {}{unit}", option.caption, value.get().round() as i32),
-            _ => option.caption.to_owned(),
-        };
+        // Every control starts 1 unit below the row top, so captions and controls share one line.
         row()
-            .width(Size::Px(COLUMN_W))
-            .height(Size::Px(34.))
-            .align(Align::Center)
+            .width(px(COLUMN_W))
+            .height(px(EXTRA_ROW_H))
+            .padding(Edges { top: 1., ..Edges::default() })
             .justify(Justify::SpaceBetween)
-            .child(label(&caption).class("caption").width(Size::Px(COLUMN_W - EXTRA_BOX_W - 6.)).height(Size::Px(22.)))
-            .child(row().width(Size::Px(EXTRA_BOX_W)).justify(Justify::End).child(node.key(&format!("Extra{i}"))))
+            .child(caption(&d.tr(option.caption)))
+            .child(control)
     }).collect();
     let right = rows.split_off(rows.len().div_ceil(2));
 
-    let left_card = col()
-        .at(12., 58.)
-        .width(Size::Px(304.))
-        .height(Size::Px(346.))
-        .child(gilded_panel(0., 0., 304., 346., 4., VELVET_CARD, d.has_menu_art))
-        .child(
-            col()
-                .at(12., 8.)
-                .width(Size::Px(COLUMN_W))
-                .gap(4.)
-                .child(label("World & Controls").class("header").height(Size::Px(22.)))
-                .child(gold_rule(COLUMN_W, d.has_menu_art))
-                .child(col().padding(Edges { top: 4., ..Edges::default() }).children(rows)),
-        );
+    let column = |rows: Vec<hp2_ui::Node>| col().width(px(COLUMN_W)).children(rows);
+    let left_card = card(d, (MARGIN, CARD_Y, CARD_W, TALL_CARD_H), "World & Controls", column(rows));
+    let right_card = card(d, (RIGHT_CARD_X, CARD_Y, CARD_W, TALL_CARD_H), "Display & Accessibility", column(right));
 
-    let right_card = col()
-        .at(324., 58.)
-        .width(Size::Px(304.))
-        .height(Size::Px(346.))
-        .child(gilded_panel(0., 0., 304., 346., 4., VELVET_CARD, d.has_menu_art))
-        .child(
-            col()
-                .at(12., 8.)
-                .width(Size::Px(COLUMN_W))
-                .gap(4.)
-                .child(label("Display & Accessibility").class("header").height(Size::Px(22.)))
-                .child(gold_rule(COLUMN_W, d.has_menu_art))
-                .child(col().padding(Edges { top: 4., ..Edges::default() }).children(right)),
-        );
-
-    let mut footer_inner = row().at(12., 8.).width(Size::Px(534.)).height(Size::Px(38.)).align(Align::Center).gap(10.);
-    if d.has_menu_art {
-        footer_inner = footer_inner.child(
-            image(TextureRef(TEX_GRYF_CREST.to_owned()), Fit::Region(10., 8., 44., 50.))
-                .width(Size::Px(30.))
-                .height(Size::Px(34.))
-                .color(Color::WHITE)
-                .blend(BlendMode::Masked),
-        );
-    }
-    footer_inner = footer_inner.child(
-        col()
-            .gap(1.)
-            .child(label("Hogwarts Graphics & Accessibility").class("footer-title").height(Size::Px(17.)))
-            .child(label("HD Textures and enhancements apply immediately as you toggle them.").class("footer-note").height(Size::Px(16.))),
-    );
-    let footer = col()
-        .at(12., 414.)
-        .width(Size::Px(558.))
-        .height(Size::Px(54.))
-        .child(gilded_panel(0., 0., 558., 54., 4., VELVET_HEADER, d.has_menu_art))
-        .child(footer_inner);
+    let note = col()
+        .gap(2.)
+        .child(label(&d.tr("Hogwarts Graphics & Accessibility")).class("footer-title").height(px(17.)))
+        .child(label(&d.tr("HD Textures and enhancements apply immediately as you toggle them.")).class("footer-note").height(px(16.)));
+    let footer_content = row()
+        .align(Align::Center)
+        .gap(10.)
+        .child(crest(art))
+        .child(note);
 
     col()
-        .width(Size::Px(640.))
-        .height(Size::Px(480.))
-        .child(header_bar(d, "More Options", TEX_SCROLL_ICON, (2., 2., 43., 44.), (28., 29.)))
+        .width(px(640.))
+        .height(px(480.))
+        .child(header_bar(d, "More Options", art.scroll.then(|| icon(TEX_SCROLL_ICON, (2., 2., 43., 44.), (28., 29.)))))
         .child(left_card)
         .child(right_card)
-        .child(footer)
+        .child(strip(d, FOOTER_Y, FOOTER_H, VELVET_HEADER, footer_content))
+}
+
+/// The small Gryffindor crest of the footers, or the same space left empty without its art.
+fn crest(art: MenuArt) -> hp2_ui::Node {
+    if art.crest {
+        icon(TEX_GRYF_CREST, (10., 8., 44., 50.), (CREST_W, 30.))
+    } else {
+        col().width(px(CREST_W)).height(px(30.))
+    }
 }
 
 fn view(d: &Rc<Data>) -> hp2_ui::Node {
     if d.more.get() {
         return extras_view(d);
     }
+    let art = d.art.get();
     let resolution = select_node(d, Ctl::Resolution, &d.resolution, &d.resolution_options.get(), true);
     let textures = select_node(d, Ctl::Textures, &d.textures, &d.texture_options.get(), true);
+    let scale_row = row()
+        .width(px(COLUMN_W))
+        .height(px(COMBO_ROW_H))
+        .align(Align::Center)
+        .justify(Justify::SpaceBetween)
+        .child(caption(&format!("{}: {}%", d.tr("3D Scale"), scale_percent(d.scale.get()))))
+        .child(col().width(px(ART_W)).child(slider_node(d, Ctl::Scale, 0., 15., &d.scale)));
     let video_body = col()
-        .at(12., 7.)
-        .width(Size::Px(COLUMN_W))
-        .gap(3.)
-        .child(label("Video").class("header").height(Size::Px(22.)))
-        .child(gold_rule(COLUMN_W, d.has_menu_art))
-        .child(
-            col()
-                .padding(Edges { top: 2., ..Edges::default() })
-                .child(combo_row("Logical res.", resolution, 26.))
-                .child(combo_row("Textures", textures, 26.))
-                .child(slider_row("Object Detail", slider_node(d, Ctl::ObjectDetail, 0., 4., &d.object_detail), 37.))
-                .child(slider_row("Brightness", slider_node(d, Ctl::Brightness, 2., 10., &d.brightness), 37.))
-                .child({
-                    let percent = scale_percent(d.scale.get());
-                    let scale = slider_node(d, Ctl::Scale, 0., 15., &d.scale);
-                    row()
-                        .width(Size::Px(COLUMN_W))
-                        .height(Size::Px(25.))
-                        .align(Align::Center)
-                        .justify(Justify::SpaceBetween)
-                        .child(label(&format!("3D Scale: {percent}%")).class("caption").height(Size::Px(22.)))
-                        .child(col().width(Size::Px(ART_W)).child(scale))
-                }),
-        );
-    let video_card = col()
-        .at(12., 58.)
-        .width(Size::Px(304.))
-        .height(Size::Px(194.))
-        .child(gilded_panel(0., 0., 304., 194., 4., VELVET_CARD, d.has_menu_art))
-        .child(video_body);
+        .child(combo_row(&d.tr("Logical res."), resolution, COMBO_ROW_H))
+        .child(combo_row(&d.tr("Textures"), textures, COMBO_ROW_H))
+        .child(slider_row(d, &d.tr("Object Detail"), slider_node(d, Ctl::ObjectDetail, 0., 4., &d.object_detail)))
+        .child(slider_row(d, &d.tr("Brightness"), slider_node(d, Ctl::Brightness, 2., 10., &d.brightness)))
+        .child(scale_row);
+    let video_card = card(d, (MARGIN, CARD_Y, CARD_W, TOP_CARD_H), "Video", video_body);
 
     let display = select_node(d, Ctl::Display, &d.display, &d.display_options, false);
     let fps = {
         let (queue, signal) = (d.queue.clone(), d.show_fps.clone());
-        checkbox("Show FPS", d.show_fps.get(), move |on| {
+        checkbox(&d.tr("Show FPS"), d.show_fps.get(), move |on| {
             signal.set(on);
             queue.borrow_mut().push(Command::Check(Ctl::ShowFps, on));
         })
         .key(&key_of(Ctl::ShowFps))
         .class("caption")
+        .height(px(WIDGET_H))
     };
     let audio_body = col()
-        .at(12., 7.)
-        .width(Size::Px(COLUMN_W))
-        .gap(3.)
-        .child(label("Audio & Display").class("header").height(Size::Px(22.)))
-        .child(gold_rule(COLUMN_W, d.has_menu_art))
-        .child(
-            col()
-                .padding(Edges { top: 4., ..Edges::default() })
-                .gap(2.)
-                .child(slider_row(&format!("Music: {}%", d.music.get() as i32), slider_node(d, Ctl::Music, 0., 100., &d.music), 40.))
-                .child(slider_row(&format!("Sound: {}%", d.sound.get() as i32), slider_node(d, Ctl::Sound, 0., 100., &d.sound), 40.))
-                .child(col().padding(Edges { top: 2., bottom: 2., ..Edges::default() }).child(gold_rule(COLUMN_W, d.has_menu_art)))
-                .child(combo_row("Display", display, 28.))
-                .child(row().width(Size::Px(COLUMN_W)).height(Size::Px(24.)).align(Align::Center).justify(Justify::End).child(col().width(Size::Px(ART_W)).child(fps))),
-        );
-    let audio_card = col()
-        .at(324., 58.)
-        .width(Size::Px(304.))
-        .height(Size::Px(194.))
-        .child(gilded_panel(0., 0., 304., 194., 4., VELVET_CARD, d.has_menu_art))
-        .child(audio_body);
+        .gap(4.)
+        .child(slider_row(d, &format!("{}: {}%", d.tr("Music"), d.music.get() as i32), slider_node(d, Ctl::Music, 0., 100., &d.music)))
+        .child(slider_row(d, &format!("{}: {}%", d.tr("Sound"), d.sound.get() as i32), slider_node(d, Ctl::Sound, 0., 100., &d.sound)))
+        .child(rule_block(COLUMN_W, art.toolbar))
+        .child(combo_row(&d.tr("Display"), display, COMBO_ROW_H))
+        // The tick box lines up with the combo box above it.
+        .child(row().width(px(COLUMN_W)).height(px(WIDGET_H)).justify(Justify::End).child(col().width(px(ART_W)).child(fps)));
+    let audio_card = card(d, (RIGHT_CARD_X, CARD_Y, CARD_W, TOP_CARD_H), "Audio & Display", audio_body);
 
-    // Advanced: the GPU and display rows, then the image-quality features; five per column.
-    let mut rows: Vec<hp2_ui::Node> = d.advanced.iter().enumerate().map(|(i, r)| combo_row(r.caption, select_node(d, Ctl::Advanced(i), &r.current, &r.options, false), ADVANCED_ROW_H)).collect();
+    // Advanced: the GPU and display rows, then the first image-quality features; five per column.
+    let mut rows: Vec<hp2_ui::Node> = d.advanced.iter().enumerate().map(|(i, r)| combo_row(&d.tr(r.caption), select_node(d, Ctl::Advanced(i), &r.current, &r.options, false), COMBO_ROW_H)).collect();
     for (i, caption) in QUALITY_CAPTIONS.iter().enumerate().take(QUALITY_ROWS) {
-        let options = ["On".to_owned(), "Off".to_owned()];
+        let labels = [d.tr("On"), d.tr("Off")];
         let (queue, signal) = (d.queue.clone(), d.quality[i].clone());
         let selected = usize::from(!signal.get());
-        let node = select(&options, selected, move |choice| {
+        let node = select(&labels, selected, move |choice| {
             signal.set(choice == 0);
             queue.borrow_mut().push(Command::Quality(i, choice == 0));
         })
         .key(&key_of(Ctl::Quality(i)))
-        .width(Size::Px(ART_W))
+        .width(px(ART_W))
         .color(IVORY)
         .font(Font::Bold);
-        rows.push(combo_row(caption, node, ADVANCED_ROW_H));
+        rows.push(combo_row(&d.tr(caption), node, COMBO_ROW_H));
     }
     let right: Vec<_> = rows.split_off(rows.len().div_ceil(2));
-    let left = rows;
-    let advanced_column = |rows: Vec<hp2_ui::Node>| col().width(Size::Px(COLUMN_W)).children(rows);
+    let column = |rows: Vec<hp2_ui::Node>| col().width(px(COLUMN_W)).children(rows);
+    let advanced_body = row().gap(WIDE_W - 2. * CARD_PAD - 2. * COLUMN_W).child(column(rows)).child(column(right));
+    let advanced_card = card(d, (MARGIN, ADVANCED_Y, WIDE_W, ADVANCED_H), "Advanced Graphics", advanced_body);
 
-    // Enhancements: 2 clean rows of 4 checkboxes, kept left of x=572 to leave the Back arrow clear.
-    let effects_total_w = 548.;
-    let effect_w = effects_total_w / 4.;
+    // Footer: the crest, then the remaining image-quality features as a 4 x 2 checkbox grid.
     let effects: Vec<hp2_ui::Node> = (QUALITY_ROWS..QUALITY_CAPTIONS.len()).map(|i| {
         let (queue, signal) = (d.queue.clone(), d.quality[i].clone());
-        checkbox(QUALITY_CAPTIONS[i], signal.get(), move |on| {
+        checkbox(&d.tr(QUALITY_CAPTIONS[i]), signal.get(), move |on| {
             signal.set(on);
             queue.borrow_mut().push(Command::Quality(i, on));
         })
         .key(&key_of(Ctl::Quality(i)))
         .class("caption")
-        .width(Size::Px(effect_w))
-        .height(Size::Px(EFFECT_ROW_H))
+        .width(px(EFFECT_W))
+        .height(px(CHECK_ROW_H))
     }).collect();
     let mut effects = effects.into_iter().peekable();
-    let mut effect_rows = Vec::new();
+    let mut grid = col();
     while effects.peek().is_some() {
-        effect_rows.push(row().children(effects.by_ref().take(4).collect::<Vec<_>>()));
+        grid = grid.child(row().children(effects.by_ref().take(4).collect::<Vec<_>>()));
     }
-
-    let advanced_card = col()
-        .at(12., 260.)
-        .width(Size::Px(616.))
-        .height(Size::Px(212.))
-        .child(gilded_panel(0., 0., 616., 212., 4., VELVET_CARD, d.has_menu_art))
-        .child(
-            col()
-                .at(12., 7.)
-                .width(Size::Px(592.))
-                .gap(3.)
-                .child(label("Advanced Graphics").class("header").height(Size::Px(22.)))
-                .child(gold_rule(592., d.has_menu_art))
-                .child(
-                    row()
-                        .padding(Edges { top: 2., ..Edges::default() })
-                        .gap(32.)
-                        .child(advanced_column(left))
-                        .child(advanced_column(right)),
-                )
-                .child(col().padding(Edges { top: 2., bottom: 1., ..Edges::default() }).child(gold_rule(effects_total_w, d.has_menu_art)))
-                .child(col().width(Size::Px(effects_total_w)).children(effect_rows)),
-        );
+    let footer_content = row().align(Align::Center).gap(10.).child(crest(art)).child(grid);
 
     col()
-        .width(Size::Px(640.))
-        .height(Size::Px(480.))
-        .child(header_bar(d, "Sound & Video", TEX_EYE_ICON, (1., 5., 47., 42.), (32., 28.)))
+        .width(px(640.))
+        .height(px(480.))
+        .child(header_bar(d, "Sound & Video", art.eye.then(|| icon(TEX_EYE_ICON, (1., 5., 47., 42.), (32., 28.)))))
         .child(video_card)
         .child(audio_card)
         .child(advanced_card)
+        .child(strip(d, FOOTER_Y, FOOTER_H, VELVET_HEADER, footer_content))
 }
 
 /// The stock 12-step render-scale slider as a percent.
 fn scale_percent(step: f32) -> i32 {
     const SCALES: [i32; 16] = [50, 55, 60, 65, 67, 70, 75, 80, 85, 90, 95, 100, 125, 150, 175, 200];
     SCALES.get(step.round().max(0.) as usize).copied().unwrap_or(100)
+}
+
+// ---- art -----------------------------------------------------------------------------------------
+
+/// Whether the texture `path` is resident; when `load`, a missing one is loaded first with
+/// `DynamicLoadObject` (the `HP2_Menu` package is not loaded by the Sound/Video page itself).
+unsafe fn texture_ready(a: CoreAccess<'_>, page: *mut UObject, path: &str, load: bool) -> bool {
+    if unsafe { find_texture(a, path) }.is_ok() {
+        return true;
+    }
+    if !load {
+        return false;
+    }
+    let loaded = (|| -> RuntimeResult<()> {
+        let f = unsafe { declared(a, "Core.Object.DynamicLoadObject")? };
+        let Some(class) = (unsafe { find_class(a, "Engine.Texture")? }) else { return Ok(()) };
+        if f.is_null() {
+            return Ok(());
+        }
+        let mut texture: *mut UObject = std::ptr::null_mut();
+        unsafe { invoke_resolved(a, page, f, &[("ObjectName", V::S(path)), ("ObjectClass", V::Obj(class.cast()))], &[], (&raw mut texture).cast())? };
+        Ok(())
+    })();
+    if let Err(error) = loaded {
+        warn(a, &error);
+    }
+    unsafe { find_texture(a, path) }.is_ok()
+}
+
+/// Which menu art can be drawn now. Every texture is checked on its own.
+unsafe fn menu_art(a: CoreAccess<'_>, page: *mut UObject, load: bool) -> MenuArt {
+    let ready = |path: &str| unsafe { texture_ready(a, page, path, load) };
+    let bar = [ready(TEX_BAR_LEFT), ready(TEX_BAR_MID), ready(TEX_BAR_RIGHT)];
+    MenuArt {
+        toolbar: bar.iter().all(|&loaded| loaded),
+        eye: ready(TEX_EYE_ICON),
+        scroll: ready(TEX_SCROLL_ICON),
+        crest: ready(TEX_GRYF_CREST),
+    }
 }
 
 // ---- page state -------------------------------------------------------------------------------
@@ -707,6 +900,10 @@ struct PageUi {
     data: Rc<Data>,
     metrics: HostMetrics,
     hidden: bool,
+    /// Missing menu art was already asked for once (`DynamicLoadObject`); later paints only look.
+    art_requested: bool,
+    /// Canvas `SizeX`/`SizeY` the text widths in `metrics` were measured at.
+    measured_at: (i32, i32),
 }
 
 thread_local! {
@@ -829,24 +1026,14 @@ unsafe fn int_param(a: CoreAccess<'_>, f: *mut UFunction, params: *const u8, siz
 /// Builds the page's UI the first time it is painted (the stock controls exist by then).
 unsafe fn create(a: CoreAccess<'_>, page: *mut UObject) -> RuntimeResult<PageUi> {
     let store = Store::new();
-    let has_menu_art = [
-        TEX_BAR_LEFT,
-        TEX_BAR_MID,
-        TEX_BAR_RIGHT,
-        TEX_EYE_ICON,
-        TEX_SCROLL_ICON,
-        TEX_GRYF_CREST,
-    ]
-    .iter()
-    .all(|name| unsafe { find_texture(a, name) }.is_ok());
-    let data = Data::new(&store, has_menu_art);
+    let data = Data::new(&store, polish_language(a));
     let metrics = HostMetrics::default();
     let view_data = data.clone();
     let mut ui = Ui::new(store, move || view(&view_data), metrics.clone()).with_stylesheet(stylesheet()).with_skin(skin());
     ui.resize(640., 480.);
     let handles = unsafe { Handles::resolve(a, page)? };
     unsafe { refresh(a, &data, &handles)? };
-    Ok(PageUi { page: unsafe { Weak::new(page) }, ui, data, metrics, hidden: false })
+    Ok(PageUi { page: unsafe { Weak::new(page) }, ui, data, metrics, hidden: false, art_requested: false, measured_at: (0, 0) })
 }
 
 /// Removes every stock control except the Back button from the page's window list.
@@ -879,12 +1066,24 @@ unsafe fn paint_callback(a: CoreAccess<'_>, receiver: *mut UObject, function: *m
                 unsafe { hide_stock_controls(a, receiver)? };
                 entry.hidden = true;
             }
+            // Checked every paint: a texture that is gone (garbage collected) must never be drawn.
+            let load = !entry.art_requested;
+            entry.art_requested = true;
+            entry.data.art.set(unsafe { menu_art(a, receiver, load) });
             // While a command is waiting for the next tick, the stock controls are stale: do not overwrite the view.
             if entry.data.queue.borrow().is_empty() {
                 let handles = unsafe { Handles::resolve(a, receiver)? };
                 unsafe { refresh(a, &entry.data, &handles)? };
             }
             entry.ui.update();
+            // This page changes the resolution and UI scale itself: widths measured at another
+            // canvas size would misplace centred and right-aligned text, so measure again.
+            let size_of_canvas = |name: &str| unsafe { prop(a, canvas, name, "Core.IntProperty", 4).map(|p| p.cast::<i32>().read_unaligned()) };
+            let canvas_size = (size_of_canvas("SizeX")?, size_of_canvas("SizeY")?);
+            if entry.measured_at != canvas_size {
+                entry.measured_at = canvas_size;
+                entry.metrics.clear();
+            }
             let mut learned = false;
             for (text_value, font) in entry.ui.text_requests() {
                 if !entry.metrics.knows(&text_value, font) {

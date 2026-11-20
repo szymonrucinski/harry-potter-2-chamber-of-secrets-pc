@@ -2233,15 +2233,40 @@ impl<'a> DrawArena<'a> {
         }
 
         struct Binds {
-            frame: wgpu::BindGroup,
+            frame_idx: usize,
             params: wgpu::BindGroup,
-            texture: Option<wgpu::BindGroup>,
+            texture_idx: Option<usize>,
         }
-        let make = |layout_frame: &wgpu::BindGroupLayout, layout_params: &wgpu::BindGroupLayout, draw: &ArenaDraw<'_>| {
-            let frame = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("draw.rs arena frame uniforms bind group"),
-                layout: layout_frame,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: draw.frame_uniforms.as_entire_binding() }],
+        // Deduplicate per-frame frame-uniforms and texture bind groups within the pass.
+        // Auto-derived bind group layouts are unique per pipeline object, so keying by the
+        // layout pointer guarantees exact WebGPU layout compatibility.
+        let mut frame_bind_groups: Vec<wgpu::BindGroup> = Vec::with_capacity(8);
+        let mut frame_bind_map: std::collections::HashMap<(usize, usize), usize> =
+            std::collections::HashMap::with_capacity(8);
+        let mut tex_bind_groups: Vec<wgpu::BindGroup> = Vec::with_capacity(32);
+        let mut single_tex_map: std::collections::HashMap<(usize, usize, usize), usize> =
+            std::collections::HashMap::with_capacity(32);
+        let mut complex_tex_map: std::collections::HashMap<(usize, [usize; 6]), usize> =
+            std::collections::HashMap::with_capacity(32);
+
+        let mut make = |layout_frame: &wgpu::BindGroupLayout,
+                        layout_params: &wgpu::BindGroupLayout,
+                        draw: &ArenaDraw<'_>| {
+            let frame_key = (
+                layout_frame as *const wgpu::BindGroupLayout as usize,
+                draw.frame_uniforms as *const wgpu::Buffer as usize,
+            );
+            let frame_idx = *frame_bind_map.entry(frame_key).or_insert_with(|| {
+                let idx = frame_bind_groups.len();
+                frame_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("draw.rs arena frame uniforms bind group"),
+                    layout: layout_frame,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: draw.frame_uniforms.as_entire_binding(),
+                    }],
+                }));
+                idx
             });
             let params = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("draw.rs arena draw params bind group"),
@@ -2255,56 +2280,95 @@ impl<'a> DrawArena<'a> {
                     }),
                 }],
             });
-            (frame, params)
+            (frame_idx, params)
         };
-        let single = |layout: &wgpu::BindGroupLayout, view: &wgpu::TextureView, sampler: &wgpu::Sampler| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("draw.rs arena texture bind group"),
-                layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                ],
-            })
-        };
-        let binds: Vec<Binds> = self
-            .draws
-            .iter()
-            .map(|draw| match &draw.kind {
+        let mut binds: Vec<Binds> = Vec::with_capacity(self.draws.len());
+        for draw in &self.draws {
+            let entry = match &draw.kind {
                 ArenaKind::Line(p) => {
-                    let (frame, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
-                    Binds { frame, params, texture: None }
+                    let (frame_idx, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
+                    Binds { frame_idx, params, texture_idx: None }
                 }
                 ArenaKind::Point(p) => {
-                    let (frame, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
-                    Binds { frame, params, texture: None }
+                    let (frame_idx, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
+                    Binds { frame_idx, params, texture_idx: None }
                 }
                 ArenaKind::Tile(p, view, sampler) => {
-                    let (frame, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
-                    Binds { frame, params, texture: Some(single(&p.texture_layout, view, sampler)) }
+                    let (frame_idx, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
+                    let key = (
+                        &p.texture_layout as *const wgpu::BindGroupLayout as usize,
+                        *view as *const wgpu::TextureView as usize,
+                        *sampler as *const wgpu::Sampler as usize,
+                    );
+                    let tex_idx = *single_tex_map.entry(key).or_insert_with(|| {
+                        let idx = tex_bind_groups.len();
+                        tex_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("draw.rs arena texture bind group"),
+                            layout: &p.texture_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                            ],
+                        }));
+                        idx
+                    });
+                    Binds { frame_idx, params, texture_idx: Some(tex_idx) }
                 }
                 ArenaKind::Gouraud(p, view, sampler) => {
-                    let (frame, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
-                    Binds { frame, params, texture: Some(single(&p.texture_layout, view, sampler)) }
+                    let (frame_idx, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
+                    let key = (
+                        &p.texture_layout as *const wgpu::BindGroupLayout as usize,
+                        *view as *const wgpu::TextureView as usize,
+                        *sampler as *const wgpu::Sampler as usize,
+                    );
+                    let tex_idx = *single_tex_map.entry(key).or_insert_with(|| {
+                        let idx = tex_bind_groups.len();
+                        tex_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("draw.rs arena texture bind group"),
+                            layout: &p.texture_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                            ],
+                        }));
+                        idx
+                    });
+                    Binds { frame_idx, params, texture_idx: Some(tex_idx) }
                 }
                 ArenaKind::Complex(p, t) => {
-                    let (frame, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
-                    let texture = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("draw.rs arena complex texture bind group"),
-                        layout: &p.texture_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(t[0].0) },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(t[0].1) },
-                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(t[1].0) },
-                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(t[1].1) },
-                            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(t[2].0) },
-                            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(t[2].1) },
+                    let (frame_idx, params) = make(&p.frame_uniforms_layout, &p.draw_params_layout, draw);
+                    let key = (
+                        &p.texture_layout as *const wgpu::BindGroupLayout as usize,
+                        [
+                            t[0].0 as *const wgpu::TextureView as usize,
+                            t[0].1 as *const wgpu::Sampler as usize,
+                            t[1].0 as *const wgpu::TextureView as usize,
+                            t[1].1 as *const wgpu::Sampler as usize,
+                            t[2].0 as *const wgpu::TextureView as usize,
+                            t[2].1 as *const wgpu::Sampler as usize,
                         ],
+                    );
+                    let tex_idx = *complex_tex_map.entry(key).or_insert_with(|| {
+                        let idx = tex_bind_groups.len();
+                        tex_bind_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("draw.rs arena complex texture bind group"),
+                            layout: &p.texture_layout,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(t[0].0) },
+                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(t[0].1) },
+                                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(t[1].0) },
+                                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(t[1].1) },
+                                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(t[2].0) },
+                                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(t[2].1) },
+                            ],
+                        }));
+                        idx
                     });
-                    Binds { frame, params, texture: Some(texture) }
+                    Binds { frame_idx, params, texture_idx: Some(tex_idx) }
                 }
-            })
-            .collect();
+            };
+            binds.push(entry);
+        }
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("draw.rs batched render pass"),
@@ -2321,6 +2385,9 @@ impl<'a> DrawArena<'a> {
             }),
             ..Default::default()
         });
+        let mut last_pipeline: Option<usize> = None;
+        let mut last_frame_idx: Option<usize> = None;
+        let mut last_tex_idx: Option<usize> = None;
         for (draw, binds) in self.draws.iter().zip(&binds) {
             let pipeline = match &draw.kind {
                 ArenaKind::Line(p) => &p.pipeline,
@@ -2329,11 +2396,24 @@ impl<'a> DrawArena<'a> {
                 ArenaKind::Gouraud(p, ..) => &p.pipeline,
                 ArenaKind::Complex(p, ..) => &p.pipeline,
             };
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &binds.frame, &[]);
+            let pipeline_ptr = pipeline as *const wgpu::RenderPipeline as usize;
+            if last_pipeline != Some(pipeline_ptr) {
+                pass.set_pipeline(pipeline);
+                last_pipeline = Some(pipeline_ptr);
+                // Auto-derived pipeline layouts invalidate prior bind groups on pipeline switch.
+                last_frame_idx = None;
+                last_tex_idx = None;
+            }
+            if last_frame_idx != Some(binds.frame_idx) {
+                pass.set_bind_group(0, &frame_bind_groups[binds.frame_idx], &[]);
+                last_frame_idx = Some(binds.frame_idx);
+            }
             pass.set_bind_group(1, &binds.params, &[]);
-            if let Some(texture) = &binds.texture {
-                pass.set_bind_group(2, texture, &[]);
+            if let Some(tex_idx) = binds.texture_idx
+                && last_tex_idx != Some(tex_idx)
+            {
+                pass.set_bind_group(2, &tex_bind_groups[tex_idx], &[]);
+                last_tex_idx = Some(tex_idx);
             }
             pass.set_vertex_buffer(0, vertex_buffer.slice(draw.vertex_offset..draw.vertex_offset + draw.vertex_bytes));
             pass.draw(0..draw.vertex_count, 0..1);

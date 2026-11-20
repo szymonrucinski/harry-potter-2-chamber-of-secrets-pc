@@ -77,6 +77,10 @@ pub struct NativeTextLayout {
     pub poly_flags: u32,
     /// `Layout.Color` RGBA.
     pub color: [f32; 4],
+    /// Under a widescreen menu stretch, the point of the run that keeps its stretched
+    /// position: `0` the pen origin (left-aligned text), `0.5` the ink centre, `1` the ink
+    /// right edge. Usually [`crate::text_x_anchor`].
+    pub x_anchor: f32,
 }
 
 /// `DrawAtlasRect`'s rectangle inputs: the offsets from the layout's start
@@ -103,6 +107,18 @@ struct PlacedGlyph {
 fn safe_float(value: f32) -> bool {
     let value = f64::from(value);
     value.is_finite() && value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX)
+}
+
+/// Horizontal shift that moves an unstretched text run under the widescreen stretch
+/// `(src_x, dst_x, factor)` so its anchor lands on the stretched position: `anchor <= 0` pins
+/// the pen origin (left-aligned columns stay on one straight line whatever their length),
+/// otherwise the point `anchor` of the way across the ink (`0.5` centre, `1` right edge).
+/// A run without ink is not moved.
+fn stretch_shift(stretch: (f32, f32, f32), pen_x: f32, ink: Option<(f32, f32)>, anchor: f32) -> f32 {
+    let (src_x, dst_x, factor) = stretch;
+    let Some((min_x, max_x)) = ink else { return 0.0 };
+    let anchor_x = if anchor <= 0.0 { pen_x } else { min_x + (max_x - min_x) * anchor.min(1.0) };
+    dst_x + (anchor_x - src_x) * factor - anchor_x
 }
 
 /// `CalculateRasterRectangle`'s size rule (`NativeTextShared.cpp` L897-925):
@@ -244,28 +260,19 @@ impl RenderLoop {
         frame: (f32, f32),
         submit: bool,
     ) -> bool {
-        // When the 4:3 menu is stretched horizontally across a widescreen display,
-        // reposition the text run by its horizontal midpoint while keeping glyphs
-        // 1:1 unstretched so typography stays crisp and properly proportioned.
+        // When the 4:3 menu is stretched horizontally across a widescreen display, the
+        // glyphs stay 1:1 (crisp, properly proportioned) and the run moves as one piece so
+        // its anchor point lands where the stretched layout puts it.
         let saved_stretch = crate::get_tile_x_stretch();
-        let stretch_dx = if let Some((src_x, dst_x, factor)) = saved_stretch {
-            let mut min_x = f32::INFINITY;
-            let mut max_x = f32::NEG_INFINITY;
-            for glyph in placed {
-                let left = layout.origin_x + layout.start_x as f32 + glyph.left;
+        let stretch_dx = saved_stretch.map_or(0.0, |stretch| {
+            let pen_x = layout.origin_x + layout.start_x as f32;
+            let ink = placed.iter().fold(None, |ink: Option<(f32, f32)>, glyph| {
+                let left = pen_x + glyph.left;
                 let right = left + glyph.slot.width as f32;
-                min_x = min_x.min(left);
-                max_x = max_x.max(right);
-            }
-            if min_x.is_finite() && max_x.is_finite() {
-                let src_cx = 0.5 * (min_x + max_x);
-                (dst_x + (src_cx - src_x) * factor) - src_cx
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
+                Some(ink.map_or((left, right), |(min, max)| (min.min(left), max.max(right))))
+            });
+            stretch_shift(stretch, pen_x, ink, layout.x_anchor)
+        });
 
         if submit && saved_stretch.is_some() {
             crate::set_tile_x_stretch(None);
@@ -575,5 +582,37 @@ impl RenderLoop {
             );
             assert!(written, "native text page must be resident after insert");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stretch_shift;
+
+    /// 4:3 page at x=100 stretched 1.5x onto a screen starting at x=0.
+    const STRETCH: (f32, f32, f32) = (100.0, 0.0, 1.5);
+
+    #[test]
+    fn left_anchor_keeps_columns_straight_whatever_the_length() {
+        // Two captions in one column: same pen origin, different widths and side bearings.
+        let short = 110.0 + stretch_shift(STRETCH, 110.0, Some((111.0, 140.0)), 0.0);
+        let long = 110.0 + stretch_shift(STRETCH, 110.0, Some((110.5, 220.0)), 0.0);
+        assert_eq!(short, 15.0);
+        assert_eq!(long, 15.0);
+    }
+
+    #[test]
+    fn centre_and_right_anchors_land_on_the_stretched_point() {
+        // Centred: ink 110..150 centres at 130 -> stretched 45.
+        let dx = stretch_shift(STRETCH, 110.0, Some((110.0, 150.0)), 0.5);
+        assert_eq!(130.0 + dx, 45.0);
+        // A wider centred run under it shares the centre.
+        let dx = stretch_shift(STRETCH, 70.0, Some((70.0, 190.0)), 0.5);
+        assert_eq!(130.0 + dx, 45.0);
+        // Right-aligned: the right edge 150 -> stretched 75.
+        let dx = stretch_shift(STRETCH, 110.0, Some((110.0, 150.0)), 1.0);
+        assert_eq!(150.0 + dx, 75.0);
+        // No ink, no move.
+        assert_eq!(stretch_shift(STRETCH, 110.0, None, 0.5), 0.0);
     }
 }

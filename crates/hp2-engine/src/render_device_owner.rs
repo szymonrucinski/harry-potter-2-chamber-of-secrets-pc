@@ -2307,17 +2307,8 @@ impl hp2_wgpu::driver_policy::DriverPolicyAdapter for CorePolicy<'_> {
                 resources.loop_state.set_quality(wgpu_quality(quality));
                 let hd_enabled = hd_textures_enabled(self.access);
                 resources.loop_state.set_hd_textures(hd_enabled);
-                let (hd_count, hd_dir) = hp2_wgpu::hd_textures::summary();
-                if let Some(dir) = hd_dir {
-                    let _ = self.log(
-                        "Log",
-                        &format!(
-                            "WgpuDrv: HDTextures={} ({hd_count} overrides indexed from {})",
-                            hd_enabled,
-                            dir.display()
-                        ),
-                    );
-                }
+                // Always logged, so a missing or empty folder is visible in the log too.
+                let _ = self.log("Log", &hp2_wgpu::hd_textures::summary_line(hd_enabled));
                 DRAW_DISTANCE.store(draw_distance(self.access), std::sync::atomic::Ordering::Relaxed);
                 unsafe { apply_engine_quality(self.device, quality); }
                 Ok(0)
@@ -3245,8 +3236,13 @@ impl CorePolicy<'_> {
                     }
                     if !parts.is_empty() {
                         parts.reverse();
+                        // `Package.Group.Name`; the registry matches it case-insensitively.
                         let path = parts.join(".");
-                        if let Some(hd) = hp2_wgpu::hd_textures::load(&path, masked) {
+                        // Only index 0 is see-through in a masked P8 texture. Without any, an
+                        // opaque RGB override is exact (the upscaler writes RGB for those, e.g.
+                        // the HP2TopToolbar art), so alpha is only required when index 0 occurs.
+                        let needs_alpha = masked && bytes.contains(&0);
+                        if let Some(hd) = hp2_wgpu::hd_textures::load(&path, needs_alpha) {
                             return self.with_resources(|resources| {
                                 let created = resources.created.as_ref().ok_or_else(|| {
                                     RuntimeError::new("Canonical WGPU device is unavailable")
@@ -4015,6 +4011,7 @@ impl CorePolicy<'_> {
                     clip: fields.clip,
                     poly_flags: fields.poly_flags,
                     color: fields.color,
+                    x_anchor: hp2_wgpu::text_x_anchor(),
                 };
                 let services = hp2_render::native_text_layout_coretext_host::services();
                 let raster = &cache.raster;
@@ -4054,6 +4051,7 @@ impl CorePolicy<'_> {
                     clip: fields.clip,
                     poly_flags: fields.poly_flags,
                     color: fields.color,
+                    x_anchor: hp2_wgpu::text_x_anchor(),
                 };
                 let placements = &cache.raster;
                 let mut rasterize = |index: usize| {

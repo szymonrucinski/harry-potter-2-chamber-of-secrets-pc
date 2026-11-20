@@ -223,6 +223,8 @@ pub(crate) struct PaintState<'a> {
     pub open: Option<(&'a str, usize)>,
     /// Text being edited: key and buffer.
     pub edit: Option<(&'a str, &'a str)>,
+    /// Viewport height: popups that would run past it open upward.
+    pub viewport_bottom: f32,
 }
 
 const FOCUS: Color = Color(255, 214, 90, 255);
@@ -266,23 +268,25 @@ fn text(
     });
 }
 
-/// The popup rectangle of an open drop-down.
-pub(crate) fn popup_rect(anchor: Rect, options: usize, skin: &Skin) -> Rect {
+/// The popup rectangle of an open drop-down: below its box, or above it when below would run
+/// past `bottom` (the viewport height) and above fits.
+pub(crate) fn popup_rect(anchor: Rect, options: usize, skin: &Skin, bottom: f32) -> Rect {
     let p = &skin.popup;
-    Rect::new(
-        anchor.x,
-        anchor.bottom(),
-        anchor.w,
-        p.top + p.bottom + p.row_height * options as f32,
-    )
+    let h = p.top + p.bottom + p.row_height * options as f32;
+    let y = if anchor.bottom() + h > bottom && anchor.y - h >= 0. {
+        anchor.y - h
+    } else {
+        anchor.bottom()
+    };
+    Rect::new(anchor.x, y, anchor.w, h)
 }
 
 /// Where option `index` of a popup is.
-pub(crate) fn popup_row(anchor: Rect, index: usize, skin: &Skin) -> Rect {
+pub(crate) fn popup_row(anchor: Rect, options: usize, index: usize, skin: &Skin, bottom: f32) -> Rect {
     let p = &skin.popup;
     Rect::new(
         anchor.x + p.inset,
-        anchor.bottom() + p.top + p.row_height * index as f32,
+        popup_rect(anchor, options, skin, bottom).y + p.top + p.row_height * index as f32,
         anchor.w - 2. * p.inset,
         p.row_height,
     )
@@ -572,11 +576,11 @@ fn paint_node(
                     popups,
                     skin,
                     SkinPart::ListBackground,
-                    popup_rect(rect, options.len(), skin),
+                    popup_rect(rect, options.len(), skin, state.viewport_bottom),
                     FALLBACK_LIST,
                 );
                 for (index, option) in options.iter().enumerate() {
-                    let row = popup_row(rect, index, skin);
+                    let row = popup_row(rect, options.len(), index, skin, state.viewport_bottom);
                     if index == highlight {
                         part(popups, skin, SkinPart::ListRowSelected, row, FALLBACK_ROW);
                     }

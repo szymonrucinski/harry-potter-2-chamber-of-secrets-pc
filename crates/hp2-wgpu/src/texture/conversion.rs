@@ -43,27 +43,18 @@ pub fn p8_to_rgba8_bytes(
     palette: &[FColor; 256],
     mask_mode: P8MaskMode,
 ) -> Vec<u8> {
-    let mut local_palette;
-    let palette = match mask_mode {
-        P8MaskMode::Unmasked => palette,
-        P8MaskMode::Masked => {
-            local_palette = *palette;
-            local_palette[0] = FColor {
-                r: 0,
-                g: 0,
-                b: 0,
-                a: 0,
-            };
-            &local_palette
-        }
-    };
-    indices
-        .iter()
-        .flat_map(|&index| {
-            let color = palette[index as usize];
-            [color.r, color.g, color.b, color.a]
-        })
-        .collect()
+    let mut lut = [[0u8; 4]; 256];
+    for (dst, src) in lut.iter_mut().zip(palette.iter()) {
+        *dst = [src.r, src.g, src.b, src.a];
+    }
+    if mask_mode == P8MaskMode::Masked {
+        lut[0] = [0, 0, 0, 0];
+    }
+    let mut out = vec![0u8; indices.len() * 4];
+    for (&index, dst) in indices.iter().zip(out.chunks_exact_mut(4)) {
+        dst.copy_from_slice(&lut[index as usize]);
+    }
+    out
 }
 
 /// Expands tightly packed RGB8 texels and sets alpha to 255.
@@ -76,10 +67,14 @@ pub fn rgb8_to_rgba8(rgb_bytes: &[u8]) -> Vec<u8> {
         0,
         "rgb_bytes length must be a whole multiple of 3"
     );
-    rgb_bytes
-        .chunks_exact(3)
-        .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
-        .collect()
+    let mut out = vec![0u8; (rgb_bytes.len() / 3) * 4];
+    for (rgb, dst) in rgb_bytes.chunks_exact(3).zip(out.chunks_exact_mut(4)) {
+        dst[0] = rgb[0];
+        dst[1] = rgb[1];
+        dst[2] = rgb[2];
+        dst[3] = 255;
+    }
+    out
 }
 
 /// Expands little-endian RGB565 texels and sets alpha to 255.
@@ -96,17 +91,16 @@ pub fn rgb16_to_rgba8(packed_bytes: &[u8]) -> Vec<u8> {
         0,
         "packed_bytes length must be a whole multiple of 2"
     );
-    packed_bytes
-        .chunks_exact(2)
-        .flat_map(|pair| {
-            let value = u16::from_le_bytes([pair[0], pair[1]]);
-            let r5 = (value & 0x1F) as u8;
-            let g6 = ((value >> 5) & 0x3F) as u8;
-            let b5 = ((value >> 11) & 0x1F) as u8;
-            let r8 = (r5 << 3) | (r5 >> 2);
-            let g8 = (g6 << 2) | (g6 >> 4);
-            let b8 = (b5 << 3) | (b5 >> 2);
-            [r8, g8, b8, 255]
-        })
-        .collect()
+    let mut out = vec![0u8; (packed_bytes.len() / 2) * 4];
+    for (pair, dst) in packed_bytes.chunks_exact(2).zip(out.chunks_exact_mut(4)) {
+        let value = u16::from_le_bytes([pair[0], pair[1]]);
+        let r5 = (value & 0x1F) as u8;
+        let g6 = ((value >> 5) & 0x3F) as u8;
+        let b5 = ((value >> 11) & 0x1F) as u8;
+        dst[0] = (r5 << 3) | (r5 >> 2);
+        dst[1] = (g6 << 2) | (g6 >> 4);
+        dst[2] = (b5 << 3) | (b5 >> 2);
+        dst[3] = 255;
+    }
+    out
 }

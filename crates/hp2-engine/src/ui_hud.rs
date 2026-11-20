@@ -241,7 +241,6 @@ fn wrap(text: &str, width: f32, measure: &mut dyn FnMut(&str) -> f32) -> Vec<Str
 }
 
 thread_local! {
-    static METRICS: HostMetrics = HostMetrics::default();
     /// Last game time each manager's border slide was advanced at.
     static SLIDE_CLOCK: RefCell<HashMap<i32, f32>> = RefCell::new(HashMap::new());
 }
@@ -294,8 +293,9 @@ unsafe fn draw_border(a: CoreAccess<'_>, manager: *mut UObject, canvas: *mut UOb
     Ok(())
 }
 
-/// Draws `text` wrapped and centred inside the band `x0..w - x0`, `top..top + height`, with a
-/// drop shadow. The largest of `fonts` whose lines fit the band is used. Short blocks are centred
+/// Draws `text` wrapped, every line centred on `(w - x0) / 2` like the stock routine (so lines
+/// drawn with the same `x0`, such as the in-game menu's "Objective" label and objective text,
+/// share one centre), inside `top..top + height`, with a drop shadow. The largest of `fonts` whose lines fit the band is used. Short blocks are centred
 /// vertically (subtitles); taller ones start at the top (folio card descriptions).
 unsafe fn draw_wrapped(a: CoreAccess<'_>, target: &CanvasTarget, text: &str, x0: f32, top: f32, height: f32, color: Color, fonts: &[Font]) -> RuntimeResult<()> {
     let (w, h) = unsafe { (int_of(a, target.canvas, "SizeX")? as f32, int_of(a, target.canvas, "SizeY")? as f32) };
@@ -338,7 +338,9 @@ unsafe fn draw_wrapped(a: CoreAccess<'_>, target: &CanvasTarget, text: &str, x0:
         rows.push((line.clone(), color, 0., y));
     }
     let width = band;
-    let metrics = METRICS.with(Clone::clone);
+    // Measured afresh on every call: a width remembered from another canvas, text scale or
+    // font (the HUD pass, a resize, a UI-scale change) would centre the line off-centre.
+    let metrics = HostMetrics::default();
     let view = move || {
         col().children(rows.iter().map(|(text, color, x, y)| label(text).font(font).color(*color).text_align(TextAlign::Center).at(*x, *y).width(Size::Px(width)).height(Size::Px(line_h))))
     };

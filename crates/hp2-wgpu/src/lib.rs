@@ -30,6 +30,20 @@ pub mod mipmaps;
 thread_local! {
     /// Active horizontal stretch for widescreen menu rendering: `(src_x, dst_x, factor)`.
     static TILE_X_STRETCH: std::cell::Cell<Option<(f32, f32, f32)>> = const { std::cell::Cell::new(None) };
+    /// Horizontal anchor of the native text being drawn (0 left, 0.5 centre, 1 right).
+    static TEXT_X_ANCHOR: std::cell::Cell<f32> = const { std::cell::Cell::new(0.5) };
+}
+
+/// Sets which point of the next native text runs stays on its stretched 4:3 position while a
+/// [`set_tile_x_stretch`] stretch is active: `0` the left edge (pen origin), `0.5` the centre,
+/// `1` the right edge. Returns the previous anchor so callers can restore it.
+pub fn set_text_x_anchor(anchor: f32) -> f32 {
+    TEXT_X_ANCHOR.with(|cell| cell.replace(anchor))
+}
+
+/// The anchor set by [`set_text_x_anchor`] (default `0.5`, the centre).
+pub fn text_x_anchor() -> f32 {
+    TEXT_X_ANCHOR.with(std::cell::Cell::get)
 }
 
 /// Sets or clears horizontal tile/line stretch for filling widescreen displays
@@ -844,6 +858,10 @@ pub struct RenderLoop {
     /// reachable edge case, not a caller bug: `Draw2DLine` called
     /// before any `SetSceneNode` this session).
     last_scene: Option<SceneFrame>,
+    /// Cached `(rfx2, rfy2)` projection scale pair computed once per
+    /// `set_scene_node` so `queue_tile`, `queue_line`, `queue_point`, and
+    /// `queue_end_flash` avoid calling `f32::tan()` on every 2D draw.
+    last_rfx2_rfy2: Option<(f32, f32)>,
 }
 
 /// A validated logical target pair that does not replace the active frame targets.
@@ -1002,6 +1020,7 @@ impl RenderLoop {
             hdr: false,
             dummy_texture: None,
             last_scene: None,
+            last_rfx2_rfy2: None,
             capture: None,
             capture_initialized: false,
             backing_scale: 1.0,
@@ -1479,9 +1498,12 @@ impl RenderLoop {
             ),
             None => (p1, p2),
         };
+        let (rfx2, rfy2) = self
+            .last_rfx2_rfy2
+            .unwrap_or_else(|| scene_rfx2_rfy2(scene));
         let line = QueuedLine {
-            p1: draw_2d_line_screen_to_coords(scene, fx2, fy2, p1),
-            p2: draw_2d_line_screen_to_coords(scene, fx2, fy2, p2),
+            p1: screen_to_coords_with_rfx2(rfx2, rfy2, fx2, fy2, p1),
+            p2: screen_to_coords_with_rfx2(rfx2, rfy2, fx2, fy2, p2),
             color,
         };
         let state = draw::RenderState::for_line_flags(line_flags);
@@ -1556,7 +1578,9 @@ impl RenderLoop {
         let Some(cached) = self.texture_cache.get(request.cache_id) else {
             return;
         };
-        let (rfx2, rfy2) = scene_rfx2_rfy2(scene);
+        let (rfx2, rfy2) = self
+            .last_rfx2_rfy2
+            .unwrap_or_else(|| scene_rfx2_rfy2(scene));
         let (u_mult, v_mult) = texture::texture_uv_mult(
             request.u_scale,
             request.v_scale,
@@ -1684,7 +1708,9 @@ impl RenderLoop {
         let Some(segment) = self.frame_uniforms_segments.len().checked_sub(1) else {
             return;
         };
-        let (rfx2, rfy2) = scene_rfx2_rfy2(scene);
+        let (rfx2, rfy2) = self
+            .last_rfx2_rfy2
+            .unwrap_or_else(|| scene_rfx2_rfy2(scene));
         let z = resolve_point_z(scene.is_ortho, z);
         let corners = draw::point_quad_corners(draw::PointQuadRequest {
             rfx2,
@@ -1729,7 +1755,9 @@ impl RenderLoop {
         let Some(segment) = self.frame_uniforms_segments.len().checked_sub(1) else {
             return false;
         };
-        let (rfx2, rfy2) = scene_rfx2_rfy2(&scene);
+        let (rfx2, rfy2) = self
+            .last_rfx2_rfy2
+            .unwrap_or_else(|| scene_rfx2_rfy2(&scene));
         let corners = draw::flash_quad_corners(rfx2, rfy2, scene.fx, scene.fy);
         let state = draw::RenderState::for_line_flags(draw::LINE_TRANSPARENT);
         self.push_point(segment, state, QueuedPoint { corners, color });
@@ -2303,6 +2331,7 @@ impl RenderLoop {
         queue.write_buffer(&buffer, 0, bytes);
         self.frame_uniforms_segments.push(buffer);
         self.last_scene = Some(*scene);
+        self.last_rfx2_rfy2 = Some(scene_rfx2_rfy2(scene));
     }
 
     /// How many segments the current (or most recently cleared) frame
@@ -2599,6 +2628,17 @@ fn scene_rfx2_rfy2(scene: &SceneFrame) -> (f32, f32) {
 /// FX2`/`FY2` from the actual `Draw2DLine` call site (`WgpuDrv.cpp`'s
 /// own override reads them directly off its own `Frame` parameter),
 /// not derive them from whatever scene happens to be cached.
+#[inline]
+fn screen_to_coords_with_rfx2(
+    rfx2: f32,
+    rfy2: f32,
+    fx2: f32,
+    fy2: f32,
+    p: [f32; 3],
+) -> [f32; 3] {
+    [rfx2 * p[2] * (p[0] - fx2), rfy2 * p[2] * (p[1] - fy2), p[2]]
+}
+
 pub fn draw_2d_line_screen_to_coords(
     scene: &SceneFrame,
     fx2: f32,
@@ -2606,7 +2646,7 @@ pub fn draw_2d_line_screen_to_coords(
     p: [f32; 3],
 ) -> [f32; 3] {
     let (rfx2, rfy2) = scene_rfx2_rfy2(scene);
-    [rfx2 * p[2] * (p[0] - fx2), rfy2 * p[2] * (p[1] - fy2), p[2]]
+    screen_to_coords_with_rfx2(rfx2, rfy2, fx2, fy2, p)
 }
 
 /// Real `Draw2DPoint`'s own Z adjustment (`DrawSimple.cpp:170-173`:
@@ -8924,6 +8964,7 @@ fn f(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             clip,
             poly_flags: 0,
             color: [1.0, 1.0, 1.0, 1.0],
+            x_anchor: 0.5,
         }
     }
 

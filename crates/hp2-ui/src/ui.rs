@@ -263,6 +263,7 @@ impl Ui {
                 .edit
                 .as_ref()
                 .map(|e| (e.key.as_str(), e.text.as_str())),
+            viewport_bottom: self.size.1,
         };
         paint(&self.root, &state, &self.skin, self.metrics.as_ref())
     }
@@ -308,7 +309,7 @@ impl Ui {
                 }
             })
             && let Some(index) =
-                (0..count).find(|&i| popup_row(anchor, i, &self.skin).contains(x, y))
+                (0..count).find(|&i| popup_row(anchor, count, i, &self.skin, self.size.1).contains(x, y))
         {
             self.open = Some((key, index));
         }
@@ -339,9 +340,9 @@ impl Ui {
             });
             if let Some((rect, count, _, on_select)) = anchor {
                 self.open = None;
-                if popup_rect(rect, count, &self.skin).contains(x, y) {
-                    if let Some(index) =
-                        (0..count).find(|&i| popup_row(rect, i, &self.skin).contains(x, y))
+                if popup_rect(rect, count, &self.skin, self.size.1).contains(x, y) {
+                    if let Some(index) = (0..count)
+                        .find(|&i| popup_row(rect, count, i, &self.skin, self.size.1).contains(x, y))
                     {
                         on_select(index);
                     }

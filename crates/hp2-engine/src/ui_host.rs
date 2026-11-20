@@ -233,7 +233,18 @@ pub(crate) unsafe fn render_commands<T: DrawTarget>(target: &T, a: CoreAccess<'_
                     TextAlign::Right => rect.right() - tw,
                 };
                 let y = rect.y + (rect.h - th) / 2.;
-                unsafe { target.text_at(a, x, y, text, *font, [color.0, color.1, color.2, color.3])? };
+                // Under the widescreen menu stretch glyphs stay unstretched; the renderer keeps
+                // this point of the run on the stretched layout, so columns stay straight.
+                #[cfg(feature = "renderer-wgpu")]
+                let previous = hp2_wgpu::set_text_x_anchor(match align {
+                    TextAlign::Left => 0.,
+                    TextAlign::Center => 0.5,
+                    TextAlign::Right => 1.,
+                });
+                let drawn = unsafe { target.text_at(a, x, y, text, *font, [color.0, color.1, color.2, color.3]) };
+                #[cfg(feature = "renderer-wgpu")]
+                hp2_wgpu::set_text_x_anchor(previous);
+                drawn?;
             }
             DrawCmd::PushClip(rect) => {
                 let next = clips.last().map_or(*rect, |outer| intersect(*outer, *rect));

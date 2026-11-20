@@ -308,6 +308,31 @@ fn select_opens_picks_a_row_cycles_by_key_and_closes_on_escape() {
 }
 
 #[test]
+fn a_select_near_the_bottom_opens_its_popup_upward() {
+    let store = Store::new();
+    let choice = Rc::new(Cell::new(0usize));
+    let c = choice.clone();
+    let view = move || {
+        let c = c.clone();
+        let current = c.get();
+        col().child(
+            select(&["75%", "100%", "125%", "150%", "175%", "200%"], current, move |i| c.set(i))
+                .key("scale")
+                .at(10., 440.),
+        )
+    };
+    let mut ui = Ui::new(store, view, FixedMetrics::default());
+    ui.resize(640., 480.);
+    let (x, y) = center(&ui, "scale");
+    click(&mut ui, x, y);
+    assert_eq!(ui.open_select(), Some("scale"));
+    // Six 24 px rows plus 3 + 3 px insets end at the box's top edge (y = 440).
+    let top = 440. - (3. + 3. + 24. * 6.);
+    click(&mut ui, x, top + 3. + 24. * 4. + 12.);
+    assert_eq!((choice.get(), ui.open_select()), (4, None));
+}
+
+#[test]
 fn number_input_applies_each_valid_keystroke_clamps_on_commit_and_reverts_junk() {
     let store = Store::new();
     let speed = store.signal(3.0_f32);
