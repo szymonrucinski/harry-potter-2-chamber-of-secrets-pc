@@ -3,48 +3,18 @@
 //! mono EA-XA block decoding. [`Decoder`] mirrors `FEAXABlockDecoder`
 //! field for field; `feed`/`decode`/`reset_state` mirror its methods.
 
-#[derive(Clone, Copy)]
-struct Coefficients {
-    c0: i32,
-    c1: i32,
-}
-
-// EA's extended-XA N=8 predictor table from pinned vgmstream commit
-// 11508e91a069066d0f6526d0096568b46c354014. See
-// ThirdParty/vgmstream/COPYING for the retained ISC-style notice.
-const COEFFICIENTS: [Coefficients; 16] = [
-    Coefficients { c0: 0, c1: 0 },
-    Coefficients { c0: 240, c1: 0 },
-    Coefficients { c0: 460, c1: -208 },
-    Coefficients { c0: 392, c1: -220 },
-    Coefficients { c0: 488, c1: -240 },
-    Coefficients { c0: 328, c1: -208 },
-    Coefficients { c0: 440, c1: -168 },
-    Coefficients { c0: 420, c1: -188 },
-    Coefficients { c0: 432, c1: -176 },
-    Coefficients { c0: 240, c1: -16 },
-    Coefficients { c0: 416, c1: -192 },
-    Coefficients { c0: 424, c1: -160 },
-    Coefficients { c0: 288, c1: -8 },
-    Coefficients { c0: 436, c1: -188 },
-    Coefficients { c0: 224, c1: -1 },
-    Coefficients { c0: 272, c1: -16 },
+// Standard EA-XA v1 predictor table from vgmstream (`ea_xa_decoder.c`):
+// c0 = COEFFICIENTS[predictor], c1 = COEFFICIENTS[predictor + 4].
+const COEFFICIENTS: [i32; 20] = [
+    0, 240, 460, 392,
+    0, 0, -208, -220,
+    0, 1, 3, 4,
+    7, 8, 10, 11,
+    0, -1, -3, -4,
 ];
 
-fn floor_divide(value: i32, divisor: i32) -> i32 {
-    if value >= 0 {
-        value / divisor
-    } else {
-        -((((-(value as i64)) + divisor as i64 - 1) / divisor as i64) as i32)
-    }
-}
-
-fn scale_nibble(nibble: i32, range: i32) -> i32 {
-    if range <= 12 {
-        nibble * (1 << (12 - range))
-    } else {
-        floor_divide(nibble, 1 << (range - 12))
-    }
+fn scale_nibble(nibble: i32, range: i32) -> i64 {
+    ((nibble as i64) << 28) >> (range + 8)
 }
 
 fn clamp_sample(sample: i32) -> i16 {
@@ -161,14 +131,16 @@ impl Decoder {
             };
             let predictor = (block[0] >> 4) as usize;
             let range = (block[0] & 15) as i32;
-            let coefficients = COEFFICIENTS[predictor];
+            let c0 = COEFFICIENTS[predictor];
+            let c1 = COEFFICIENTS[predictor + 4];
             let block_samples = self.samples_remaining.min(28);
             for index in 0..block_samples {
                 let packed = block[1 + (index / 2) as usize];
+                // EA-XA packs the first sample of each byte in the high nibble.
                 let unsigned_nibble = (if index & 1 != 0 {
-                    packed >> 4
-                } else {
                     packed & 15
+                } else {
+                    packed >> 4
                 }) as i32;
                 let signed_nibble = if unsigned_nibble >= 8 {
                     unsigned_nibble - 16
@@ -176,14 +148,11 @@ impl Decoder {
                     unsigned_nibble
                 };
                 let sample = scale_nibble(signed_nibble, range);
-                let accumulator = sample as i64 * 256
-                    + coefficients.c0 as i64 * self.history1 as i64
-                    + coefficients.c1 as i64 * self.history2 as i64;
-                let decoded = if accumulator >= 0 {
-                    (accumulator / 256) as i32
-                } else {
-                    -(((-accumulator + 255) / 256) as i32)
-                };
+                let accumulator = sample
+                    + c0 as i64 * self.history1 as i64
+                    + c1 as i64 * self.history2 as i64
+                    + 128;
+                let decoded = (accumulator >> 8) as i32;
                 let clamped = clamp_sample(decoded);
                 self.residue[index as usize] = clamped;
                 self.history2 = self.history1;
@@ -281,10 +250,24 @@ mod tests {
         }
         assert_eq!(&actual[..28], &expected);
         assert_eq!(expected, [
-            3, 5, 7, 9, 11, 13, 15, 17, 18, 19, 20, 21, 22, 23,
-            24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 33, 33, 33, 33,
+            3, 6, 9, 11, 13, 15, 17, 19, 21, 23, 25, 26, 27, 28,
+            29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 41,
         ]);
         assert_eq!(&actual[28..], &[0, 0]);
+    }
+
+    #[test]
+    fn high_nibble_is_decoded_before_low_nibble() {
+        let mut block = [0u8; 15];
+        block[0] = 12; // predictor=0, range=12 -> 1x scale
+        block[1] = 0x31; // high=3, low=1
+        let mut decoder = Decoder::new();
+        let mut out = [0i16; 2];
+        unsafe {
+            assert!(decoder.feed(block.as_ptr(), 15, 2));
+            assert_eq!(decoder.decode(out.as_mut_ptr(), 2), 2);
+        }
+        assert_eq!(out, [3, 1]);
     }
 
     #[test]
@@ -331,7 +314,7 @@ mod tests {
             assert!(decoder.feed(block.as_ptr(), 15, 1));
             decoder.decode(out.as_mut_ptr(), 1);
         }
-        // accumulator = 0*256 + 240*1000 + 0*(-1000) = 240000; /256 = 937
-        assert_eq!(out[0], 937);
+        // accumulator = 0 + 240*1000 + 0*(-1000) + 128 = 240128; >> 8 = 938
+        assert_eq!(out[0], 938);
     }
 }

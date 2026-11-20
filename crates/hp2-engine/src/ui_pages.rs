@@ -7,19 +7,35 @@ use std::{cell::RefCell, collections::HashMap, ffi::c_void, rc::Rc};
 use hp2_abi::engine::generated::{UFunction, UObject};
 use hp2_core::{core_access::{CoreAccess, RuntimeError, RuntimeResult}, name_owner::FindName};
 use hp2_ui::{
-    Align, Color, Edges, Font, Justify, Key, PointerButton, PopupMetrics, Signal, Size, Skin, SkinPart, SliderMetrics, Store, Style, Stylesheet, Ui,
-    button, checkbox, col, label, row, select, slider,
+    Align, BlendMode, Color, Edges, Fit, Font, Justify, Key, PointerButton, PopupMetrics, Signal, Size, Skin, SkinPart, SliderMetrics, Store, Style, Stylesheet, TextureRef, Ui,
+    button, checkbox, col, image, label, row, select, slider,
 };
 
 use crate::{
     stock_graphics_menu::{boolean, children, field, live, object, prop, read_boolean, set_text, text, Weak},
-    ui_host::{class_name_of, find_class, name_of, read_string, HostMetrics, Surface},
+    ui_host::{class_name_of, find_class, find_texture, name_of, read_string, HostMetrics, Surface},
     ui_vm::{invoke, V},
 };
 
 const PAGE_CLASS: &str = "FESoundVideoPage";
-const GREEN: Color = Color(40, 180, 40, 255);
-const GREY: Color = Color(200, 200, 200, 255);
+/// Hogwarts antique gold & warm parchment palette matching the main menu book frames.
+const GOLD_TITLE: Color = Color(252, 224, 144, 255);
+const GOLD_SECTION: Color = Color(244, 212, 128, 255);
+const PARCHMENT: Color = Color(238, 228, 198, 255);
+const IVORY: Color = Color(255, 248, 226, 255);
+const HINT_PARCHMENT: Color = Color(188, 176, 148, 255);
+const VELVET_HEADER: Color = Color(245, 245, 255, 255);
+const VELVET_CARD: Color = Color(186, 192, 220, 255);
+const FALLBACK_VELVET: Color = Color(26, 33, 68, 255);
+const FALLBACK_GOLD: Color = Color(196, 152, 66, 255);
+const FALLBACK_GOLD_DARK: Color = Color(98, 70, 22, 255);
+
+const TEX_BAR_LEFT: &str = "HP2_Menu.Icons.HP2TopToolbarLeft";
+const TEX_BAR_MID: &str = "HP2_Menu.Icons.HP2TopToolbarMiddle";
+const TEX_BAR_RIGHT: &str = "HP2_Menu.Icons.HP2TopToolbarRight";
+const TEX_EYE_ICON: &str = "HP2_Menu.Icons.HP2MenuSoundOptions";
+const TEX_SCROLL_ICON: &str = "HP2_Menu.Icons.HP2Options";
+const TEX_GRYF_CREST: &str = "HP2_Menu.Icons.HP2GriffindorCrestSm";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ctl {
@@ -66,6 +82,12 @@ pub(crate) struct ExtraOption {
 fn extra_options() -> Vec<ExtraOption> {
     use crate::{audio_owner as audio, display_options as display, input_options as input, ui_accessibility as access};
     vec![
+        ExtraOption {
+            caption: "HD Textures",
+            kind: ExtraKind::Toggle,
+            get: |a| f32::from(u8::from(crate::render_device_owner::hd_textures_enabled(a))),
+            set: |a, v| unsafe { crate::render_device_owner::set_hd_textures_enabled(a, v >= 0.5) },
+        },
         ExtraOption {
             caption: "Draw Distance",
             kind: ExtraKind::Choice(["Original", "2x", "4x"].into_iter().map(str::to_owned).collect()),
@@ -179,12 +201,14 @@ struct Data {
     advanced: Vec<AdvancedRow>,
     /// The "More options" panel is shown instead of the Video/Audio panel.
     more: Signal<bool>,
+    /// True when the main-menu `HP2_Menu` gilded velvet toolbar & crest textures are loaded.
+    has_menu_art: bool,
     extras: Vec<(ExtraOption, Signal<f32>)>,
     queue: Rc<RefCell<Vec<Command>>>,
 }
 
 impl Data {
-    fn new(store: &Store) -> Rc<Self> {
+    fn new(store: &Store, has_menu_art: bool) -> Rc<Self> {
         let advanced = crate::stock_graphics_menu::advanced_rows()
             .into_iter()
             .map(|(caption, options)| AdvancedRow { caption, options: options.into_iter().map(str::to_owned).collect(), current: store.signal(String::new()) })
@@ -205,6 +229,7 @@ impl Data {
             quality: std::array::from_fn(|_| store.signal(false)),
             advanced,
             more: store.signal(false),
+            has_menu_art,
             extras: extra_options().into_iter().map(|o| (o, store.signal(0.))).collect(),
             queue: Rc::new(RefCell::new(Vec::new())),
         })
@@ -213,18 +238,25 @@ impl Data {
 
 fn stylesheet() -> Stylesheet {
     Stylesheet::new()
-        .with("header", Style { color: Color::WHITE, font: Font::Bold, ..Style::default() })
-        .with("caption", Style { color: GREEN, font: Font::Bold, ..Style::default() })
-        .with("small-caption", Style { color: GREEN, font: Font::Normal, ..Style::default() })
-        .with("hint", Style { color: Color::WHITE, font: Font::Normal, ..Style::default() })
+        .with("page-title", Style { color: GOLD_TITLE, font: Font::Slot(4), ..Style::default() })
+        .with("header", Style { color: GOLD_SECTION, font: Font::Slot(5), ..Style::default() })
+        .with("caption", Style { color: PARCHMENT, font: Font::Bold, ..Style::default() })
+        .with("small-caption", Style { color: PARCHMENT, font: Font::Normal, ..Style::default() })
+        .with("hint", Style { color: HINT_PARCHMENT, font: Font::Normal, ..Style::default() })
+        .with("nav-btn", Style { color: IVORY, font: Font::Bold, ..Style::default() })
+        .with("footer-title", Style { color: GOLD_SECTION, font: Font::Bold, ..Style::default() })
+        .with("footer-note", Style { color: HINT_PARCHMENT, font: Font::Normal, ..Style::default() })
 }
 
 fn skin() -> Skin {
     const ICONS: &str = "HGame.Icons.";
     let named = |n: &str| format!("{ICONS}{n}");
     Skin::new()
-        .with_native(SkinPart::BoxIdle, &named("FEComboIdleTexture"))
-        .with_native(SkinPart::BoxHover, &named("FEComboOverTexture"))
+        .with_region(SkinPart::ButtonIdle, &named("FEComboIdleTexture"), (0., 0., 180., 24.))
+        .with_region(SkinPart::ButtonHover, &named("FEComboOverTexture"), (0., 0., 180., 24.))
+        .with_region(SkinPart::ButtonDown, &named("FEOverOptionTexture"), (0., 0., 180., 24.))
+        .with_region(SkinPart::BoxIdle, &named("FEComboIdleTexture"), (0., 0., 180., 24.))
+        .with_region(SkinPart::BoxHover, &named("FEComboOverTexture"), (0., 0., 180., 24.))
         .with_native(SkinPart::SliderTrack, &named("FESliderTexture"))
         .with_native(SkinPart::SliderTrackHover, &named("FEOverSliderTexture"))
         .with_native(SkinPart::SliderThumb, &named("FESliderKnobTexture"))
@@ -232,7 +264,7 @@ fn skin() -> Skin {
         .with_native(SkinPart::CheckOffHover, &named("FEOptionTickUncheckedOverTex"))
         .with_native(SkinPart::CheckOn, &named("FEOptionTickCheckedTex"))
         .with_native(SkinPart::CheckOnHover, &named("FEOptionTickCheckedOverTex"))
-        .with_region(SkinPart::ListBackground, &named("FEComboListLarge"), (0., 0., 147., 89.))
+        .with_region(SkinPart::ListBackground, &named("FEComboListLarge"), (0., 0., 180., 86.))
         .with(SkinPart::ListRowSelected, &named("FEComboListBox"))
         .with_slider(SliderMetrics { track_dx: -1., thumb_start: 9., travel: 99., thumb_width: 10. })
         .with_check_size(12.)
@@ -262,12 +294,88 @@ const COLUMN_W: f32 = 280.;
 const QUALITY_CAPTIONS: [&str; crate::render_device_owner::QUALITY_COUNT] =
     ["Mipmaps", "Edge AA", "Light filter", "Bloom", "Soft shadows", "Rich color", "Sharpen", "Smooth edges", "Full detail", "HDR", "Fog"];
 const QUALITY_ROWS: usize = 3;
+/// Every combo box and slider shares the exact same width so controls lock onto one vertical grid.
 const ART_W: f32 = 133.;
-const EFFECT_ROW_H: f32 = 20.;
+const EFFECT_ROW_H: f32 = 21.;
 /// Width of every "More options" control (the slider art width), so they line up.
 const EXTRA_BOX_W: f32 = ART_W;
-/// Advanced rows are shorter than the Video/Audio rows so the Enhancements fit on the page.
-const ADVANCED_ROW_H: f32 = 22.;
+/// Advanced rows are compact so the Enhancements checkboxes stay clear of the Back button.
+const ADVANCED_ROW_H: f32 = 23.;
+
+/// 9-slice royal-indigo velvet panel framed with the main menu's gilded antique-gold bevel.
+fn gilded_panel(x: f32, y: f32, w: f32, h: f32, border: f32, tint: Color, has_art: bool) -> hp2_ui::Node {
+    let mut panel = col().at(x, y).width(Size::Px(w)).height(Size::Px(h));
+    if !has_art {
+        return panel
+            .background(FALLBACK_GOLD_DARK)
+            .child(col().at(1., 1.).width(Size::Px(w - 2.)).height(Size::Px(h - 2.)).background(FALLBACK_GOLD))
+            .child(col().at(border, border).width(Size::Px((w - 2. * border).max(0.))).height(Size::Px((h - 2. * border).max(0.))).background(FALLBACK_VELVET));
+    }
+    let b = border;
+    let iw = (w - 2. * b).max(0.);
+    let ih = (h - 2. * b).max(0.);
+    let piece = |tex: &str, region: (f32, f32, f32, f32), px: f32, py: f32, pw: f32, ph: f32, color: Color| {
+        image(TextureRef(tex.to_owned()), Fit::Region(region.0, region.1, region.2, region.3))
+            .at(px, py)
+            .width(Size::Px(pw))
+            .height(Size::Px(ph))
+            .color(color)
+            .blend(BlendMode::Masked)
+    };
+    // Royal velvet interior
+    panel = panel.child(piece(TEX_BAR_MID, (0., 11., 256., 75.), b, b, iw, ih, tint));
+    // Four beveled antique-gold rails
+    panel = panel.child(piece(TEX_BAR_MID, (0., 0., 256., 11.), b, 0., iw, b, Color::WHITE));
+    panel = panel.child(piece(TEX_BAR_MID, (0., 86., 256., 11.), b, h - b, iw, b, Color::WHITE));
+    panel = panel.child(piece(TEX_BAR_LEFT, (0., 11., 11., 75.), 0., b, b, ih, Color::WHITE));
+    panel = panel.child(piece(TEX_BAR_RIGHT, (117., 11., 11., 75.), w - b, b, b, ih, Color::WHITE));
+    // Four gilded corners
+    panel = panel.child(piece(TEX_BAR_LEFT, (0., 0., 11., 11.), 0., 0., b, b, Color::WHITE));
+    panel = panel.child(piece(TEX_BAR_LEFT, (0., 86., 11., 11.), 0., h - b, b, b, Color::WHITE));
+    panel = panel.child(piece(TEX_BAR_RIGHT, (117., 0., 11., 11.), w - b, 0., b, b, Color::WHITE));
+    panel = panel.child(piece(TEX_BAR_RIGHT, (117., 86., 11., 11.), w - b, h - b, b, b, Color::WHITE));
+    panel
+}
+
+/// Slender burnished-gold horizontal rule separating a card's title from its controls.
+fn gold_rule(w: f32, has_art: bool) -> hp2_ui::Node {
+    if has_art {
+        image(TextureRef(TEX_BAR_MID.to_owned()), Fit::Region(0., 0., 256., 11.))
+            .width(Size::Px(w))
+            .height(Size::Px(2.5))
+            .color(Color(235, 220, 180, 255))
+            .blend(BlendMode::Masked)
+    } else {
+        col().width(Size::Px(w)).height(Size::Px(1.5)).background(FALLBACK_GOLD)
+    }
+}
+
+/// Ornate top Hogwarts banner matching the main menu's gilded toolbar.
+fn header_bar(d: &Rc<Data>, title: &str, icon_tex: &str, icon_region: (f32, f32, f32, f32), icon_size: (f32, f32)) -> hp2_ui::Node {
+    let mut bar = col().at(12., 6.).width(Size::Px(616.)).height(Size::Px(44.));
+    bar = bar.child(gilded_panel(0., 0., 616., 44., 5., VELVET_HEADER, d.has_menu_art));
+    let mut left = row().align(Align::Center).gap(10.);
+    if d.has_menu_art {
+        left = left.child(
+            image(TextureRef(icon_tex.to_owned()), Fit::Region(icon_region.0, icon_region.1, icon_region.2, icon_region.3))
+                .width(Size::Px(icon_size.0))
+                .height(Size::Px(icon_size.1))
+                .color(Color::WHITE)
+                .blend(BlendMode::Masked),
+        );
+    }
+    left = left.child(label(title).class("page-title").height(Size::Px(30.)));
+    bar.child(
+        row()
+            .at(14., 7.)
+            .width(Size::Px(588.))
+            .height(Size::Px(30.))
+            .align(Align::Center)
+            .justify(Justify::SpaceBetween)
+            .child(left)
+            .child(panel_switch(d)),
+    )
+}
 
 fn key_of(ctl: Ctl) -> String {
     format!("{ctl:?}")
@@ -297,39 +405,43 @@ fn select_node(d: &Rc<Data>, ctl: Ctl, current: &Signal<String>, options: &[Stri
         queue.borrow_mut().push(if by_index { Command::PickIndex(ctl, i) } else { Command::PickText(ctl, choice.clone()) });
     })
     .key(&key_of(ctl))
-    .color(GREY)
+    .width(Size::Px(ART_W))
+    .color(IVORY)
     .font(Font::Bold)
 }
 
-/// Caption on the left and a value box on the right, the box right-aligned in the column.
+/// Left-aligned warm parchment caption + right-aligned bronze combo box on one crisp grid.
 fn combo_row(caption: &str, select_node: hp2_ui::Node, height: f32) -> hp2_ui::Node {
-    row().width(Size::Px(COLUMN_W)).height(Size::Px(height)).justify(Justify::End).gap(20.).child(label(caption).class("caption").height(Size::Px(24.))).child(select_node)
+    row()
+        .width(Size::Px(COLUMN_W))
+        .height(Size::Px(height))
+        .align(Align::Center)
+        .justify(Justify::SpaceBetween)
+        .child(label(caption).class("caption").height(Size::Px(22.)))
+        .child(select_node)
 }
 
-/// Caption on the left, slider right-aligned with Low/High under it.
+/// Left-aligned parchment caption + right-aligned emerald/gold slider with Low/High hints.
 fn slider_row(caption: &str, slider_node: hp2_ui::Node, height: f32) -> hp2_ui::Node {
     let hints = row().width(Size::Px(ART_W)).justify(Justify::SpaceBetween).child(label("Low").class("hint")).child(label("High").class("hint"));
     row()
         .width(Size::Px(COLUMN_W))
         .height(Size::Px(height))
         .justify(Justify::SpaceBetween)
-        .child(label(caption).class("caption").height(Size::Px(24.)).padding(Edges { top: 3., ..Edges::default() }))
-        .child(col().width(Size::Px(ART_W)).gap(4.).child(slider_node).child(hints))
+        .child(label(caption).class("caption").height(Size::Px(22.)).padding(Edges { top: 2., ..Edges::default() }))
+        .child(col().width(Size::Px(ART_W)).gap(1.).child(slider_node).child(hints))
 }
 
-/// A volume block: the live caption above the slider.
-fn volume_block(caption: String, slider_node: hp2_ui::Node) -> hp2_ui::Node {
-    let hints = row().width(Size::Px(ART_W)).justify(Justify::SpaceBetween).child(label("Low").class("hint")).child(label("High").class("hint"));
-    row().width(Size::Px(COLUMN_W)).height(Size::Px(72.)).justify(Justify::End).child(
-        col().width(Size::Px(ART_W)).gap(0.).child(label(&caption).class("caption").height(Size::Px(20.))).child(slider_node).child(col().height(Size::Px(4.))).child(hints),
-    )
-}
-
-/// The button that flips between the Video/Audio panel and the "More options" panel.
+/// The gilded bronze button that flips between the Sound & Video and More Options panels.
 fn panel_switch(d: &Rc<Data>) -> hp2_ui::Node {
     let more = d.more.clone();
-    let caption = if more.get() { "< Video and Audio" } else { "More options >" };
-    button(caption).key("PanelSwitch").class("caption").on_click(move || more.set(!more.get()))
+    let caption = if more.get() { "< Sound & Video" } else { "More Options >" };
+    button(caption)
+        .key("PanelSwitch")
+        .class("nav-btn")
+        .width(Size::Px(148.))
+        .height(Size::Px(24.))
+        .on_click(move || more.set(!more.get()))
 }
 
 fn extras_view(d: &Rc<Data>) -> hp2_ui::Node {
@@ -343,7 +455,7 @@ fn extras_view(d: &Rc<Data>) -> hp2_ui::Node {
                     signal.set(v);
                     queue.borrow_mut().push(Command::Extra(i, v));
                 })
-                .color(GREY)
+                .color(IVORY)
                 .font(Font::Bold)
                 .width(Size::Px(ART_W))
             }
@@ -353,7 +465,7 @@ fn extras_view(d: &Rc<Data>) -> hp2_ui::Node {
                     signal.set(choice as f32);
                     queue.borrow_mut().push(Command::Extra(i, choice as f32));
                 })
-                .color(GREY)
+                .color(IVORY)
                 .font(Font::Bold)
                 .width(Size::Px(ART_W))
             }
@@ -368,16 +480,74 @@ fn extras_view(d: &Rc<Data>) -> hp2_ui::Node {
         };
         row()
             .width(Size::Px(COLUMN_W))
-            .height(Size::Px(30.))
-            .child(label(&caption).class("caption").width(Size::Px(COLUMN_W - EXTRA_BOX_W)).height(Size::Px(24.)))
+            .height(Size::Px(34.))
+            .align(Align::Center)
+            .justify(Justify::SpaceBetween)
+            .child(label(&caption).class("caption").width(Size::Px(COLUMN_W - EXTRA_BOX_W - 6.)).height(Size::Px(22.)))
             .child(row().width(Size::Px(EXTRA_BOX_W)).justify(Justify::End).child(node.key(&format!("Extra{i}"))))
     }).collect();
     let right = rows.split_off(rows.len().div_ceil(2));
-    let column = |rows: Vec<hp2_ui::Node>| col().width(Size::Px(COLUMN_W)).children(rows);
+
+    let left_card = col()
+        .at(12., 58.)
+        .width(Size::Px(304.))
+        .height(Size::Px(346.))
+        .child(gilded_panel(0., 0., 304., 346., 4., VELVET_CARD, d.has_menu_art))
+        .child(
+            col()
+                .at(12., 8.)
+                .width(Size::Px(COLUMN_W))
+                .gap(4.)
+                .child(label("World & Controls").class("header").height(Size::Px(22.)))
+                .child(gold_rule(COLUMN_W, d.has_menu_art))
+                .child(col().padding(Edges { top: 4., ..Edges::default() }).children(rows)),
+        );
+
+    let right_card = col()
+        .at(324., 58.)
+        .width(Size::Px(304.))
+        .height(Size::Px(346.))
+        .child(gilded_panel(0., 0., 304., 346., 4., VELVET_CARD, d.has_menu_art))
+        .child(
+            col()
+                .at(12., 8.)
+                .width(Size::Px(COLUMN_W))
+                .gap(4.)
+                .child(label("Display & Accessibility").class("header").height(Size::Px(22.)))
+                .child(gold_rule(COLUMN_W, d.has_menu_art))
+                .child(col().padding(Edges { top: 4., ..Edges::default() }).children(right)),
+        );
+
+    let mut footer_inner = row().at(12., 8.).width(Size::Px(534.)).height(Size::Px(38.)).align(Align::Center).gap(10.);
+    if d.has_menu_art {
+        footer_inner = footer_inner.child(
+            image(TextureRef(TEX_GRYF_CREST.to_owned()), Fit::Region(10., 8., 44., 50.))
+                .width(Size::Px(30.))
+                .height(Size::Px(34.))
+                .color(Color::WHITE)
+                .blend(BlendMode::Masked),
+        );
+    }
+    footer_inner = footer_inner.child(
+        col()
+            .gap(1.)
+            .child(label("Hogwarts Graphics & Accessibility").class("footer-title").height(Size::Px(17.)))
+            .child(label("HD Textures and enhancements apply immediately as you toggle them.").class("footer-note").height(Size::Px(16.))),
+    );
+    let footer = col()
+        .at(12., 414.)
+        .width(Size::Px(558.))
+        .height(Size::Px(54.))
+        .child(gilded_panel(0., 0., 558., 54., 4., VELVET_HEADER, d.has_menu_art))
+        .child(footer_inner);
+
     col()
-        .padding(Edges { top: 44., left: 30., ..Edges::default() })
-        .child(row().width(Size::Px(COLUMN_W * 2. + 16.)).height(Size::Px(26.)).justify(Justify::SpaceBetween).child(label("More options").class("header")).child(panel_switch(d)))
-        .child(row().gap(16.).child(column(rows)).child(column(right)))
+        .width(Size::Px(640.))
+        .height(Size::Px(480.))
+        .child(header_bar(d, "More Options", TEX_SCROLL_ICON, (2., 2., 43., 44.), (28., 29.)))
+        .child(left_card)
+        .child(right_card)
+        .child(footer)
 }
 
 fn view(d: &Rc<Data>) -> hp2_ui::Node {
@@ -386,23 +556,38 @@ fn view(d: &Rc<Data>) -> hp2_ui::Node {
     }
     let resolution = select_node(d, Ctl::Resolution, &d.resolution, &d.resolution_options.get(), true);
     let textures = select_node(d, Ctl::Textures, &d.textures, &d.texture_options.get(), true);
-    let video = col()
+    let video_body = col()
+        .at(12., 7.)
         .width(Size::Px(COLUMN_W))
-        .child(label("Video").class("header").height(Size::Px(26.)))
-        .child(combo_row("Logical res.", resolution, 28.))
-        .child(combo_row("Textures", textures, 30.))
-        .child(slider_row("Object Detail", slider_node(d, Ctl::ObjectDetail, 0., 4., &d.object_detail), 46.))
-        .child(slider_row("Brightness", slider_node(d, Ctl::Brightness, 2., 10., &d.brightness), 46.))
-        .child({
-            let percent = scale_percent(d.scale.get());
-            let scale = slider_node(d, Ctl::Scale, 0., 15., &d.scale);
-            row()
-                .width(Size::Px(COLUMN_W))
-                .height(Size::Px(30.))
-                .justify(Justify::SpaceBetween)
-                .child(label(&format!("3D Scale: {percent}%")).class("small-caption").height(Size::Px(24.)))
-                .child(col().width(Size::Px(ART_W)).child(scale))
-        });
+        .gap(3.)
+        .child(label("Video").class("header").height(Size::Px(22.)))
+        .child(gold_rule(COLUMN_W, d.has_menu_art))
+        .child(
+            col()
+                .padding(Edges { top: 2., ..Edges::default() })
+                .child(combo_row("Logical res.", resolution, 26.))
+                .child(combo_row("Textures", textures, 26.))
+                .child(slider_row("Object Detail", slider_node(d, Ctl::ObjectDetail, 0., 4., &d.object_detail), 37.))
+                .child(slider_row("Brightness", slider_node(d, Ctl::Brightness, 2., 10., &d.brightness), 37.))
+                .child({
+                    let percent = scale_percent(d.scale.get());
+                    let scale = slider_node(d, Ctl::Scale, 0., 15., &d.scale);
+                    row()
+                        .width(Size::Px(COLUMN_W))
+                        .height(Size::Px(25.))
+                        .align(Align::Center)
+                        .justify(Justify::SpaceBetween)
+                        .child(label(&format!("3D Scale: {percent}%")).class("caption").height(Size::Px(22.)))
+                        .child(col().width(Size::Px(ART_W)).child(scale))
+                }),
+        );
+    let video_card = col()
+        .at(12., 58.)
+        .width(Size::Px(304.))
+        .height(Size::Px(194.))
+        .child(gilded_panel(0., 0., 304., 194., 4., VELVET_CARD, d.has_menu_art))
+        .child(video_body);
+
     let display = select_node(d, Ctl::Display, &d.display, &d.display_options, false);
     let fps = {
         let (queue, signal) = (d.queue.clone(), d.show_fps.clone());
@@ -413,13 +598,28 @@ fn view(d: &Rc<Data>) -> hp2_ui::Node {
         .key(&key_of(Ctl::ShowFps))
         .class("caption")
     };
-    let audio = col()
+    let audio_body = col()
+        .at(12., 7.)
         .width(Size::Px(COLUMN_W))
-        .child(row().width(Size::Px(COLUMN_W)).height(Size::Px(26.)).justify(Justify::SpaceBetween).child(label("Audio").class("header")).child(panel_switch(d)))
-        .child(volume_block(format!("Music Volume - {}", d.music.get() as i32), slider_node(d, Ctl::Music, 0., 100., &d.music)))
-        .child(volume_block(format!("Sound Volume - {}", d.sound.get() as i32), slider_node(d, Ctl::Sound, 0., 100., &d.sound)))
-        .child(combo_row("Display", display, 32.))
-        .child(row().width(Size::Px(COLUMN_W)).height(Size::Px(26.)).justify(Justify::End).child(col().width(Size::Px(ART_W)).child(fps)));
+        .gap(3.)
+        .child(label("Audio & Display").class("header").height(Size::Px(22.)))
+        .child(gold_rule(COLUMN_W, d.has_menu_art))
+        .child(
+            col()
+                .padding(Edges { top: 4., ..Edges::default() })
+                .gap(2.)
+                .child(slider_row(&format!("Music: {}%", d.music.get() as i32), slider_node(d, Ctl::Music, 0., 100., &d.music), 40.))
+                .child(slider_row(&format!("Sound: {}%", d.sound.get() as i32), slider_node(d, Ctl::Sound, 0., 100., &d.sound), 40.))
+                .child(col().padding(Edges { top: 2., bottom: 2., ..Edges::default() }).child(gold_rule(COLUMN_W, d.has_menu_art)))
+                .child(combo_row("Display", display, 28.))
+                .child(row().width(Size::Px(COLUMN_W)).height(Size::Px(24.)).align(Align::Center).justify(Justify::End).child(col().width(Size::Px(ART_W)).child(fps))),
+        );
+    let audio_card = col()
+        .at(324., 58.)
+        .width(Size::Px(304.))
+        .height(Size::Px(194.))
+        .child(gilded_panel(0., 0., 304., 194., 4., VELVET_CARD, d.has_menu_art))
+        .child(audio_body);
 
     // Advanced: the GPU and display rows, then the image-quality features; five per column.
     let mut rows: Vec<hp2_ui::Node> = d.advanced.iter().enumerate().map(|(i, r)| combo_row(r.caption, select_node(d, Ctl::Advanced(i), &r.current, &r.options, false), ADVANCED_ROW_H)).collect();
@@ -432,7 +632,8 @@ fn view(d: &Rc<Data>) -> hp2_ui::Node {
             queue.borrow_mut().push(Command::Quality(i, choice == 0));
         })
         .key(&key_of(Ctl::Quality(i)))
-        .color(GREY)
+        .width(Size::Px(ART_W))
+        .color(IVORY)
         .font(Font::Bold);
         rows.push(combo_row(caption, node, ADVANCED_ROW_H));
     }
@@ -440,8 +641,9 @@ fn view(d: &Rc<Data>) -> hp2_ui::Node {
     let left = rows;
     let advanced_column = |rows: Vec<hp2_ui::Node>| col().width(Size::Px(COLUMN_W)).children(rows);
 
-    // Enhancements: compact checkboxes, four per row across both columns.
-    let effect_w = (COLUMN_W * 2. + 16.) / 4.;
+    // Enhancements: 2 clean rows of 4 checkboxes, kept left of x=572 to leave the Back arrow clear.
+    let effects_total_w = 548.;
+    let effect_w = effects_total_w / 4.;
     let effects: Vec<hp2_ui::Node> = (QUALITY_ROWS..QUALITY_CAPTIONS.len()).map(|i| {
         let (queue, signal) = (d.queue.clone(), d.quality[i].clone());
         checkbox(QUALITY_CAPTIONS[i], signal.get(), move |on| {
@@ -459,9 +661,36 @@ fn view(d: &Rc<Data>) -> hp2_ui::Node {
         effect_rows.push(row().children(effects.by_ref().take(4).collect::<Vec<_>>()));
     }
 
-    col().padding(Edges { top: 44., left: 30., ..Edges::default() }).child(row().gap(16.).height(Size::Px(226.)).align(Align::Start).child(video).child(audio)).child(
-        col().child(label("Advanced").class("header").height(Size::Px(24.))).child(row().gap(16.).child(advanced_column(left)).child(advanced_column(right))),
-    ).child(col().children(effect_rows))
+    let advanced_card = col()
+        .at(12., 260.)
+        .width(Size::Px(616.))
+        .height(Size::Px(212.))
+        .child(gilded_panel(0., 0., 616., 212., 4., VELVET_CARD, d.has_menu_art))
+        .child(
+            col()
+                .at(12., 7.)
+                .width(Size::Px(592.))
+                .gap(3.)
+                .child(label("Advanced Graphics").class("header").height(Size::Px(22.)))
+                .child(gold_rule(592., d.has_menu_art))
+                .child(
+                    row()
+                        .padding(Edges { top: 2., ..Edges::default() })
+                        .gap(32.)
+                        .child(advanced_column(left))
+                        .child(advanced_column(right)),
+                )
+                .child(col().padding(Edges { top: 2., bottom: 1., ..Edges::default() }).child(gold_rule(effects_total_w, d.has_menu_art)))
+                .child(col().width(Size::Px(effects_total_w)).children(effect_rows)),
+        );
+
+    col()
+        .width(Size::Px(640.))
+        .height(Size::Px(480.))
+        .child(header_bar(d, "Sound & Video", TEX_EYE_ICON, (1., 5., 47., 42.), (32., 28.)))
+        .child(video_card)
+        .child(audio_card)
+        .child(advanced_card)
 }
 
 /// The stock 12-step render-scale slider as a percent.
@@ -600,7 +829,17 @@ unsafe fn int_param(a: CoreAccess<'_>, f: *mut UFunction, params: *const u8, siz
 /// Builds the page's UI the first time it is painted (the stock controls exist by then).
 unsafe fn create(a: CoreAccess<'_>, page: *mut UObject) -> RuntimeResult<PageUi> {
     let store = Store::new();
-    let data = Data::new(&store);
+    let has_menu_art = [
+        TEX_BAR_LEFT,
+        TEX_BAR_MID,
+        TEX_BAR_RIGHT,
+        TEX_EYE_ICON,
+        TEX_SCROLL_ICON,
+        TEX_GRYF_CREST,
+    ]
+    .iter()
+    .all(|name| unsafe { find_texture(a, name) }.is_ok());
+    let data = Data::new(&store, has_menu_art);
     let metrics = HostMetrics::default();
     let view_data = data.clone();
     let mut ui = Ui::new(store, move || view(&view_data), metrics.clone()).with_stylesheet(stylesheet()).with_skin(skin());

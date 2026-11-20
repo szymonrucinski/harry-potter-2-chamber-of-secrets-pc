@@ -203,16 +203,93 @@ impl Host<'_> {
             Some(font)
         }
     }
+    fn storybook_font(&self, unscaled_height: i32, scale: f64) -> Option<Owned> {
+        let (candidates, boost): (&[&str], f64) = if unscaled_height >= 20 {
+            // Large headings & quest banners (e.g. Polish Font1 = 24pt): authentic Hogwarts storybook serif.
+            (
+                &[
+                    "Luminari-Regular",
+                    "Luminari",
+                    "HoeflerText-Black",
+                    "IowanOldStyle-Bold",
+                    "Palatino-Bold",
+                ],
+                1.14,
+            )
+        } else if unscaled_height >= 16 {
+            // Section headers & HUD counters (e.g. Font2 = 18pt).
+            (
+                &[
+                    "IowanOldStyle-Bold",
+                    "Palatino-Bold",
+                    "HoeflerText-Black",
+                    "Times New Roman Bold",
+                ],
+                1.05,
+            )
+        } else if unscaled_height >= 13 {
+            // Menu items, subtitles & labels (e.g. Font3 = 14pt).
+            (
+                &[
+                    "IowanOldStyle-Bold",
+                    "Palatino-Bold",
+                    "IowanOldStyle-Roman",
+                    "Times New Roman Bold",
+                ],
+                1.04,
+            )
+        } else {
+            // Compact labels & card body text (e.g. Font4 = 12pt).
+            (
+                &["IowanOldStyle-Roman", "Palatino-Roman", "Times New Roman"],
+                1.04,
+            )
+        };
+        let point_size = unscaled_height as f64 * scale * boost;
+        for name in candidates {
+            let utf16: Vec<u16> = name.encode_utf16().collect();
+            if let Some(font) = self.named(&utf16, point_size) {
+                return Some(font);
+            }
+        }
+        None
+    }
     fn role_font(&self, role: u32, size: f64) -> Option<Owned> {
         if !common::valid_point_size(size) {
             return None;
         }
         let bold = common::bold(role);
-        for name in if bold {
-            ["Times New Roman Bold", "Times-Bold"]
+        if role == 7 {
+            for (name, boost) in [
+                ("Luminari-Regular", 1.14),
+                ("Luminari", 1.14),
+                ("IowanOldStyle-Bold", 1.05),
+                ("Palatino-Bold", 1.05),
+                ("Times New Roman Bold", 1.0),
+                ("Times-Bold", 1.0),
+            ] {
+                let utf16: Vec<u16> = name.encode_utf16().collect();
+                if let Some(font) = self.named(&utf16, size * boost) {
+                    return Some(font);
+                }
+            }
+        }
+        let candidates: &[&str] = if bold || matches!(role, 6 | 9) {
+            &[
+                "IowanOldStyle-Bold",
+                "Palatino-Bold",
+                "Times New Roman Bold",
+                "Times-Bold",
+            ]
         } else {
-            ["Times New Roman", "Times-Roman"]
-        } {
+            &[
+                "IowanOldStyle-Roman",
+                "Palatino-Roman",
+                "Times New Roman",
+                "Times-Roman",
+            ]
+        };
+        for name in candidates {
             let name: Vec<u16> = name.encode_utf16().collect();
             if let Some(font) = self.named(&name, size) {
                 return Some(font);
@@ -750,7 +827,23 @@ pub unsafe fn create(
         } else {
             common::role_size(8)
         };
-        base = host.named(&family.text, size as f64 * scale);
+        let is_legacy_sans = String::from_utf16(&family.text).ok().is_some_and(|s| {
+            matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "ms sans serif"
+                    | "microsoft sans serif"
+                    | "tahoma"
+                    | "arial"
+                    | "helvetica"
+                    | "sansserif"
+            )
+        });
+        if is_legacy_sans {
+            base = host.storybook_font(size, scale);
+        }
+        if base.is_none() {
+            base = host.named(&family.text, size as f64 * scale);
+        }
     }
     if base.is_none() {
         let mut size = common::role_size(role);

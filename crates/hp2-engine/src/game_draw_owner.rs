@@ -553,6 +553,20 @@ impl crate::game_tick::draw::DrawOps for CoreDrawOps<'_> {
         unsafe { viewport_ui_scale(viewport.cast()) }
     }
 
+    unsafe fn menu_book_is_open(&self, console: *mut std::ffi::c_void) -> RuntimeResult<bool> {
+        let console = console.cast::<UObject>();
+        if console.is_null() {
+            return Ok(false);
+        }
+        let Ok(book) = (unsafe { crate::stock_graphics_menu::object(self.access, console, "menuBook") }) else {
+            return Ok(false);
+        };
+        if !crate::stock_graphics_menu::live(self.access, book) {
+            return Ok(false);
+        }
+        Ok(unsafe { crate::stock_graphics_menu::read_boolean(self.access, book, "bIsOpen") }.unwrap_or(false))
+    }
+
     unsafe fn apply_console_ui_scale(
         &self,
         viewport: *mut std::ffi::c_void,

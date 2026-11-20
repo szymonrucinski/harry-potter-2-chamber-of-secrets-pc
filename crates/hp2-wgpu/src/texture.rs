@@ -400,7 +400,9 @@ impl TextureCache {
         };
         let levels = if self.generate_mips { crate::mipmaps::level_count(width, height) } else { 1 };
         let reuse = self.entries.get(&cache_id).is_some_and(|existing| {
-            existing.texture.width() == width
+            existing.width == width
+                && existing.height == height
+                && existing.texture.width() == width
                 && existing.texture.height() == height
                 && existing.texture.format() == format
                 && existing.texture.mip_level_count() == levels
@@ -415,6 +417,65 @@ impl TextureCache {
         }
         let sampler_key = self.first_sampler_key(cache_id, sampler_key);
         let mut texture = create_gpu_texture_levels(created, width, height, rgba8_bytes, srgb, levels);
+        texture.sampler_key = sampler_key;
+        self.entries.insert(cache_id, texture);
+        self.entries
+            .get(&cache_id)
+            .expect("just inserted this cache_id above")
+    }
+
+    /// Uploads a high-resolution RGBA8 override while preserving `logical_width`
+    /// and `logical_height` on [`CachedTexture`] so UE1 UV scaling (`UScale * USize`)
+    /// remains identical to the original texture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_rgba8_hd(
+        &mut self,
+        created: &crate::CreatedDevice,
+        cache_id: u64,
+        logical_width: u32,
+        logical_height: u32,
+        gpu_width: u32,
+        gpu_height: u32,
+        rgba8_bytes: &[u8],
+        options: TextureOptions,
+    ) -> &CachedTexture {
+        let TextureOptions { srgb, sampler_key } = options;
+        assert_eq!(
+            rgba8_bytes.len(),
+            gpu_width as usize * gpu_height as usize * 4,
+            "rgba8_bytes length must be exactly gpu_width * gpu_height * 4 bytes"
+        );
+        let format = if srgb {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
+        let levels = if self.generate_mips {
+            crate::mipmaps::level_count(gpu_width, gpu_height)
+        } else {
+            1
+        };
+        let reuse = self.entries.get(&cache_id).is_some_and(|existing| {
+            existing.width == logical_width
+                && existing.height == logical_height
+                && existing.texture.width() == gpu_width
+                && existing.texture.height() == gpu_height
+                && existing.texture.format() == format
+                && existing.texture.mip_level_count() == levels
+        });
+        if reuse {
+            let existing = self
+                .entries
+                .get(&cache_id)
+                .expect("reuse was decided from this cache_id's entry above");
+            write_rgba8_chain(created, &existing.texture, gpu_width, gpu_height, rgba8_bytes, srgb);
+            return existing;
+        }
+        let sampler_key = self.first_sampler_key(cache_id, sampler_key);
+        let mut texture =
+            create_gpu_texture_levels(created, gpu_width, gpu_height, rgba8_bytes, srgb, levels);
+        texture.width = logical_width;
+        texture.height = logical_height;
         texture.sampler_key = sampler_key;
         self.entries.insert(cache_id, texture);
         self.entries

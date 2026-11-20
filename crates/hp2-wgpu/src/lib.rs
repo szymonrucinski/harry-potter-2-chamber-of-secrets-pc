@@ -17,6 +17,7 @@
 pub mod capture;
 pub mod draw;
 pub mod driver_policy;
+pub mod hd_textures;
 pub mod native_text;
 #[cfg(feature = "sdl")]
 pub mod sdl_surface;
@@ -25,6 +26,22 @@ pub mod texture;
 pub mod world_scale;
 pub mod msaa;
 pub mod mipmaps;
+
+thread_local! {
+    /// Active horizontal stretch for widescreen menu rendering: `(src_x, dst_x, factor)`.
+    static TILE_X_STRETCH: std::cell::Cell<Option<(f32, f32, f32)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Sets or clears horizontal tile/line stretch for filling widescreen displays
+/// while the 4:3 menu book is open.
+pub fn set_tile_x_stretch(stretch: Option<(f32, f32, f32)>) {
+    TILE_X_STRETCH.with(|cell| cell.set(stretch));
+}
+
+/// Returns the active horizontal stretch `(src_x, dst_x, factor)`, if any.
+pub fn get_tile_x_stretch() -> Option<(f32, f32, f32)> {
+    TILE_X_STRETCH.with(|cell| cell.get())
+}
 
 /// Backend selection, matching the plan's `[WgpuDrv.WgpuRenderDevice]
 /// Backend=Auto|Metal|Vulkan|Dx12|Gl` ini key -- `from_ffi_discriminant`
@@ -1079,6 +1096,7 @@ impl RenderLoop {
         if self.texture_cache.generate_mips != quality.mipmaps {
             self.texture_cache.generate_mips = quality.mipmaps;
             self.texture_cache.clear();
+            self.text_atlas.reset();
         }
         if self.hdr != quality.hdr {
             self.hdr = quality.hdr;
@@ -1091,6 +1109,16 @@ impl RenderLoop {
         self.point_pipelines = PipelineCache::new();
         self.gouraud_pipelines = PipelineCache::new();
         self.complex_pipelines = PipelineCache::new();
+    }
+
+    /// Toggles external HD texture overrides live, dropping the texture cache
+    /// (and text atlas) so surfaces reload immediately on the next frame.
+    pub fn set_hd_textures(&mut self, enabled: bool) {
+        if hd_textures::is_enabled() != enabled {
+            hd_textures::set_enabled(enabled);
+            self.texture_cache.clear();
+            self.text_atlas.reset();
+        }
     }
 
     pub fn set_srgb_framebuffer(&mut self, srgb: bool) {
@@ -1444,6 +1472,13 @@ impl RenderLoop {
         let Some(segment) = self.frame_uniforms_segments.len().checked_sub(1) else {
             return;
         };
+        let (p1, p2) = match get_tile_x_stretch() {
+            Some((src_x, dst_x, factor)) => (
+                [dst_x + (p1[0] - src_x) * factor, p1[1], p1[2]],
+                [dst_x + (p2[0] - src_x) * factor, p2[1], p2[2]],
+            ),
+            None => (p1, p2),
+        };
         let line = QueuedLine {
             p1: draw_2d_line_screen_to_coords(scene, fx2, fy2, p1),
             p2: draw_2d_line_screen_to_coords(scene, fx2, fy2, p2),
@@ -1528,14 +1563,18 @@ impl RenderLoop {
             cached.width,
             cached.height,
         );
+        let (tile_x, tile_xl) = match get_tile_x_stretch() {
+            Some((src_x, dst_x, factor)) => (dst_x + (request.x - src_x) * factor, request.xl * factor),
+            None => (request.x, request.xl),
+        };
         let corners = draw::tile_quad_corners(draw::TileQuadRequest {
             rfx2,
             rfy2,
             fx2: request.fx2,
             fy2: request.fy2,
-            x: request.x,
+            x: tile_x,
             y: request.y,
-            xl: request.xl,
+            xl: tile_xl,
             yl: request.yl,
             u: request.u,
             v: request.v,
@@ -2127,6 +2166,35 @@ impl RenderLoop {
         }
         self.texture_cache
             .upload_rgba8(created, cache_id, width, height, rgba8_bytes, options);
+    }
+
+    /// Uploads a high-resolution external RGBA8 texture while retaining the
+    /// original logical `(logical_width, logical_height)` for UE1 UV scaling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_texture_hd(
+        &mut self,
+        created: &CreatedDevice,
+        cache_id: u64,
+        logical_width: u32,
+        logical_height: u32,
+        gpu_width: u32,
+        gpu_height: u32,
+        rgba8_bytes: &[u8],
+        options: texture::TextureOptions,
+    ) {
+        if self.texture_cache.get(cache_id).is_some() {
+            self.flush_pending_batches(created);
+        }
+        self.texture_cache.upload_rgba8_hd(
+            created,
+            cache_id,
+            logical_width,
+            logical_height,
+            gpu_width,
+            gpu_height,
+            rgba8_bytes,
+            options,
+        );
     }
 
     /// Uploads `mips` (a real full `Info.Mips[0..NumMips)` chain) into

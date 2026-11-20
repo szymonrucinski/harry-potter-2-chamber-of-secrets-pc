@@ -1898,6 +1898,47 @@ pub(crate) fn set_draw_distance(access: CoreAccess<'_>, index: u8) -> RuntimeRes
     Ok(())
 }
 
+/// Returns whether external HD texture overrides are enabled in config (default on).
+pub(crate) fn hd_textures_enabled(access: CoreAccess<'_>) -> bool {
+    let units = |t: &str| t.chars().map(u32::from).collect::<Vec<_>>();
+    access
+        .config_get_units(&units(QUALITY_SECTION), &units("HDTextures"))
+        .ok()
+        .flatten()
+        .map(|v| {
+            v.iter()
+                .take_while(|&&c| c != 0)
+                .filter_map(|&c| char::from_u32(c))
+                .collect::<String>()
+        })
+        .map_or(true, |v| {
+            !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "off" | "0")
+        })
+}
+
+/// Persists and toggles external HD texture overrides live.
+pub(crate) unsafe fn set_hd_textures_enabled(access: CoreAccess<'_>, enabled: bool) -> RuntimeResult<()> {
+    let units = |t: &str| t.chars().map(u32::from).collect::<Vec<_>>();
+    access.config_update_system_staged(&[(
+        units(QUALITY_SECTION),
+        units("HDTextures"),
+        units(if enabled { "True" } else { "False" }),
+    )])?;
+    #[cfg(feature = "renderer-wgpu")]
+    {
+        let owner = state(access)?;
+        let device = owner.global_device.get().cast::<UWgpuRenderDevice>();
+        if !device.is_null() {
+            let runtime = owner.runtime(device as usize)?;
+            let mut lease = runtime.lease()?;
+            lease.resources().loop_state.set_hd_textures(enabled);
+        } else {
+            hp2_wgpu::hd_textures::set_enabled(enabled);
+        }
+    }
+    Ok(())
+}
+
 /// Reads every quality key; a missing key takes its default, "false"/"off"/"0" mean off.
 pub(crate) fn quality_settings(access: CoreAccess<'_>) -> [bool; QUALITY_COUNT] {
     let units = |t: &str| t.chars().map(u32::from).collect::<Vec<_>>();
@@ -2264,6 +2305,19 @@ impl hp2_wgpu::driver_policy::DriverPolicyAdapter for CorePolicy<'_> {
                 resources.loop_state.set_srgb_framebuffer(srgb);
                 let quality = quality_settings(self.access);
                 resources.loop_state.set_quality(wgpu_quality(quality));
+                let hd_enabled = hd_textures_enabled(self.access);
+                resources.loop_state.set_hd_textures(hd_enabled);
+                let (hd_count, hd_dir) = hp2_wgpu::hd_textures::summary();
+                if let Some(dir) = hd_dir {
+                    let _ = self.log(
+                        "Log",
+                        &format!(
+                            "WgpuDrv: HDTextures={} ({hd_count} overrides indexed from {})",
+                            hd_enabled,
+                            dir.display()
+                        ),
+                    );
+                }
                 DRAW_DISTANCE.store(draw_distance(self.access), std::sync::atomic::Ordering::Relaxed);
                 unsafe { apply_engine_quality(self.device, quality); }
                 Ok(0)
@@ -3163,28 +3217,94 @@ impl CorePolicy<'_> {
             return Err(RuntimeError::new("Canonical texture mip byte count is invalid"));
         }
         let bytes = unsafe { std::slice::from_raw_parts(data, expected_bytes) };
-        let rgba = match format {
-            hp2_wgpu::texture::TextureFormat::P8 => {
-                let palette = unsafe { (*info).palette.cast::<hp2_wgpu::texture::FColor>() };
-                if palette.is_null() { return Err(RuntimeError::new("Canonical P8 texture has no palette")); }
-                let palette = unsafe { &*palette.cast::<[hp2_wgpu::texture::FColor; 256]>() };
-                let mode = if masked { hp2_wgpu::texture::P8MaskMode::Masked } else { hp2_wgpu::texture::P8MaskMode::Unmasked };
-                hp2_wgpu::texture::p8_to_rgba8_bytes(bytes,palette,mode)
+        let srgb = self.read_i32(unsafe { ptr::addr_of!((*self.device).use_srgb_textures) }) != 0
+            && !matches!(format,hp2_wgpu::texture::TextureFormat::Rgba7|hp2_wgpu::texture::TextureFormat::Rgb16);
+        let options = hp2_wgpu::texture::TextureOptions {
+            srgb,
+            sampler_key: hp2_wgpu::texture::SamplerKey::from_bits(flags),
+        };
+        if format == hp2_wgpu::texture::TextureFormat::P8 {
+            let palette = unsafe { (*info).palette.cast::<hp2_wgpu::texture::FColor>() };
+            if palette.is_null() {
+                return Err(RuntimeError::new("Canonical P8 texture has no palette"));
             }
+            if hp2_wgpu::hd_textures::is_enabled() {
+                let tex = unsafe { (*info).texture.cast::<hp2_abi::engine::generated::UObject>() };
+                if !tex.is_null() && crate::ui_host::class_name_of(self.access, tex) == "Texture" {
+                    let mut parts = Vec::new();
+                    let mut cur = tex;
+                    for _ in 0..16 {
+                        if cur.is_null() {
+                            break;
+                        }
+                        let name = crate::ui_host::name_of(self.access, cur);
+                        if !name.is_empty() {
+                            parts.push(name);
+                        }
+                        cur = unsafe { (*cur).outer.cast::<hp2_abi::engine::generated::UObject>() };
+                    }
+                    if !parts.is_empty() {
+                        parts.reverse();
+                        let path = parts.join(".");
+                        if let Some(hd) = hp2_wgpu::hd_textures::load(&path, masked) {
+                            return self.with_resources(|resources| {
+                                let created = resources.created.as_ref().ok_or_else(|| {
+                                    RuntimeError::new("Canonical WGPU device is unavailable")
+                                })?;
+                                resources.loop_state.upload_texture_hd(
+                                    created,
+                                    cache_id,
+                                    width as u32,
+                                    height as u32,
+                                    hd.width,
+                                    hd.height,
+                                    &hd.rgba,
+                                    options,
+                                );
+                                Ok(())
+                            });
+                        }
+                    }
+                }
+            }
+            let palette = unsafe { &*palette.cast::<[hp2_wgpu::texture::FColor; 256]>() };
+            let mode = if masked {
+                hp2_wgpu::texture::P8MaskMode::Masked
+            } else {
+                hp2_wgpu::texture::P8MaskMode::Unmasked
+            };
+            let rgba = hp2_wgpu::texture::p8_to_rgba8_bytes(bytes, palette, mode);
+            if rgba.len() != rgba_byte_count {
+                return Err(RuntimeError::new("Canonical RGBA texture conversion has an invalid size"));
+            }
+            return self.with_resources(|resources| {
+                let created = resources
+                    .created
+                    .as_ref()
+                    .ok_or_else(|| RuntimeError::new("Canonical WGPU device is unavailable"))?;
+                resources.loop_state.upload_texture(
+                    created,
+                    cache_id,
+                    width as u32,
+                    height as u32,
+                    &rgba,
+                    options,
+                );
+                Ok(())
+            });
+        }
+        let rgba = match format {
             hp2_wgpu::texture::TextureFormat::Rgba7 | hp2_wgpu::texture::TextureFormat::Rgba8 => bytes.to_vec(),
             hp2_wgpu::texture::TextureFormat::Rgb8 => hp2_wgpu::texture::rgb8_to_rgba8(bytes),
             hp2_wgpu::texture::TextureFormat::Rgb16 => hp2_wgpu::texture::rgb16_to_rgba8(bytes),
-            hp2_wgpu::texture::TextureFormat::Dxt1 => unreachable!(),
+            hp2_wgpu::texture::TextureFormat::P8 | hp2_wgpu::texture::TextureFormat::Dxt1 => unreachable!(),
         };
         if rgba.len() != rgba_byte_count {
             return Err(RuntimeError::new("Canonical RGBA texture conversion has an invalid size"));
         }
-        let srgb = self.read_i32(unsafe { ptr::addr_of!((*self.device).use_srgb_textures) }) != 0
-            && !matches!(format,hp2_wgpu::texture::TextureFormat::Rgba7|hp2_wgpu::texture::TextureFormat::Rgb16);
         self.with_resources(|resources| {
             let created=resources.created.as_ref().ok_or_else(|| RuntimeError::new("Canonical WGPU device is unavailable"))?;
-            resources.loop_state.upload_texture(created,cache_id,width as u32,height as u32,&rgba,
-                hp2_wgpu::texture::TextureOptions { srgb, sampler_key:hp2_wgpu::texture::SamplerKey::from_bits(flags) });
+            resources.loop_state.upload_texture(created,cache_id,width as u32,height as u32,&rgba,options);
             Ok(())
         })
     }

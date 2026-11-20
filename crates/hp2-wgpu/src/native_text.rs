@@ -244,43 +244,172 @@ impl RenderLoop {
         frame: (f32, f32),
         submit: bool,
     ) -> bool {
-        for glyph in placed {
-            let rect = AtlasRect {
-                offset_x: glyph.left,
-                offset_y: glyph.top,
-                width: glyph.slot.width as f32,
-                height: glyph.slot.height as f32,
-            };
-            if !self.draw_atlas_rect(layout, &glyph.slot, rect, frame, submit) {
-                return false;
+        // When the 4:3 menu is stretched horizontally across a widescreen display,
+        // reposition the text run by its horizontal midpoint while keeping glyphs
+        // 1:1 unstretched so typography stays crisp and properly proportioned.
+        let saved_stretch = crate::get_tile_x_stretch();
+        let stretch_dx = if let Some((src_x, dst_x, factor)) = saved_stretch {
+            let mut min_x = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            for glyph in placed {
+                let left = layout.origin_x + layout.start_x as f32 + glyph.left;
+                let right = left + glyph.slot.width as f32;
+                min_x = min_x.min(left);
+                max_x = max_x.max(right);
             }
+            if min_x.is_finite() && max_x.is_finite() {
+                let src_cx = 0.5 * (min_x + max_x);
+                (dst_x + (src_cx - src_x) * factor) - src_cx
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        if submit && saved_stretch.is_some() {
+            crate::set_tile_x_stretch(None);
         }
-        for underline in underlines {
-            let width = (underline.end - underline.start) as f32;
-            if width <= 0.0 {
-                continue;
+
+        let result = (|| {
+            // Subtle dark drop shadow behind bright text for classic Hogwarts storybook legibility.
+            let luminance =
+                0.299 * layout.color[0] + 0.587 * layout.color[1] + 0.114 * layout.color[2];
+            let draw_shadow = submit && luminance > 0.35 && !placed.is_empty();
+            if draw_shadow {
+                let max_h = placed
+                    .iter()
+                    .map(|g| g.slot.height as f32)
+                    .fold(0.0f32, f32::max);
+                let shadow_offset = (max_h * 0.08).clamp(1.25, 2.5);
+                let shadow_color = [0.0, 0.0, 0.0, 1.0];
+                for glyph in placed {
+                    let rect = AtlasRect {
+                        offset_x: glyph.left,
+                        offset_y: glyph.top,
+                        width: glyph.slot.width as f32,
+                        height: glyph.slot.height as f32,
+                    };
+                    if !self.draw_atlas_rect(
+                        layout,
+                        &glyph.slot,
+                        rect,
+                        frame,
+                        true,
+                        stretch_dx + shadow_offset,
+                        shadow_offset,
+                        shadow_color,
+                        Some(0.82),
+                    ) {
+                        return false;
+                    }
+                }
+                for underline in underlines {
+                    let width = (underline.end - underline.start) as f32;
+                    if width <= 0.0 {
+                        continue;
+                    }
+                    let Some(solid) = solid else {
+                        return false;
+                    };
+                    let rect = AtlasRect {
+                        offset_x: underline.start as f32,
+                        offset_y: (underline.baseline - underline.position - underline.thickness * 0.5)
+                            as f32,
+                        width,
+                        height: underline.thickness as f32,
+                    };
+                    if !self.draw_atlas_rect(
+                        layout,
+                        &solid,
+                        rect,
+                        frame,
+                        true,
+                        stretch_dx + shadow_offset,
+                        shadow_offset,
+                        shadow_color,
+                        Some(0.82),
+                    ) {
+                        return false;
+                    }
+                }
             }
-            let Some(solid) = solid else {
-                return false;
+
+            // Gently warm pure-white menu text to parchment ivory to match the gilded frames.
+            let fg_color = if saved_stretch.is_some()
+                && layout.color[0] >= 0.99
+                && layout.color[1] >= 0.99
+                && layout.color[2] >= 0.99
+            {
+                [1.0, 0.96, 0.85, 1.0]
+            } else {
+                [layout.color[0], layout.color[1], layout.color[2], 1.0]
             };
-            let rect = AtlasRect {
-                offset_x: underline.start as f32,
-                offset_y: (underline.baseline - underline.position - underline.thickness * 0.5)
-                    as f32,
-                width,
-                height: underline.thickness as f32,
-            };
-            if !self.draw_atlas_rect(layout, &solid, rect, frame, submit) {
-                return false;
+
+            for glyph in placed {
+                let rect = AtlasRect {
+                    offset_x: glyph.left,
+                    offset_y: glyph.top,
+                    width: glyph.slot.width as f32,
+                    height: glyph.slot.height as f32,
+                };
+                if !self.draw_atlas_rect(
+                    layout,
+                    &glyph.slot,
+                    rect,
+                    frame,
+                    submit,
+                    stretch_dx,
+                    0.0,
+                    fg_color,
+                    None,
+                ) {
+                    return false;
+                }
             }
+            for underline in underlines {
+                let width = (underline.end - underline.start) as f32;
+                if width <= 0.0 {
+                    continue;
+                }
+                let Some(solid) = solid else {
+                    return false;
+                };
+                let rect = AtlasRect {
+                    offset_x: underline.start as f32,
+                    offset_y: (underline.baseline - underline.position - underline.thickness * 0.5)
+                        as f32,
+                    width,
+                    height: underline.thickness as f32,
+                };
+                if !self.draw_atlas_rect(
+                    layout,
+                    &solid,
+                    rect,
+                    frame,
+                    submit,
+                    stretch_dx,
+                    0.0,
+                    fg_color,
+                    None,
+                ) {
+                    return false;
+                }
+            }
+            true
+        })();
+
+        if submit && saved_stretch.is_some() {
+            crate::set_tile_x_stretch(saved_stretch);
         }
-        true
+        result
     }
 
     /// `DrawAtlasRect` (`NativeText.cpp` L700-756). `submit == false` is the
     /// preflight: the same clipping and validity checks run, nothing is
     /// queued, and the result is whether a submit would be accepted now
     /// (C++ `!Renderer.NoDrawTile`, L751-752).
+    #[allow(clippy::too_many_arguments)]
     fn draw_atlas_rect(
         &mut self,
         layout: &NativeTextLayout,
@@ -288,6 +417,10 @@ impl RenderLoop {
         rect: AtlasRect,
         frame: (f32, f32),
         submit: bool,
+        extra_x: f32,
+        extra_y: f32,
+        color: [f32; 4],
+        texture_alpha: Option<f32>,
     ) -> bool {
         // Page lookup (L702-705). Pages not in the texture cache are missing.
         let cache_id = native_text_page_cache_id(slot.page);
@@ -349,8 +482,8 @@ impl RenderLoop {
         // Text poly flags (L741): masked off, highlighted, translucent, two-sided.
         let text_poly_flags =
             (layout.poly_flags & !PF_MASKED) | PF_HIGHLIGHTED | PF_TRANSLUCENT | PF_TWO_SIDED;
-        let draw_x = layout.origin_x + x;
-        let draw_y = layout.origin_y + y;
+        let draw_x = layout.origin_x + x + extra_x;
+        let draw_y = layout.origin_y + y + extra_y;
         if !safe_float(draw_x)
             || !safe_float(draw_y)
             || !safe_float(width)
@@ -383,14 +516,14 @@ impl RenderLoop {
             vl: source_height,
             // `DrawAtlasRect` passes Z = 1 (L755).
             z: 1.0,
-            color: [layout.color[0], layout.color[1], layout.color[2], 1.0],
+            color,
             poly_flags: text_poly_flags,
             // `DrawNativeTextTile` sets UMult = 1/TextureWidth and
             // VMult = 1/TextureHeight (`DrawTile.cpp` L58-109). A scale of
             // 1 gives `texture_uv_mult` exactly that.
             u_scale: 1.0,
             v_scale: 1.0,
-            texture_alpha: None,
+            texture_alpha,
             fx2: frame.0,
             fy2: frame.1,
         });

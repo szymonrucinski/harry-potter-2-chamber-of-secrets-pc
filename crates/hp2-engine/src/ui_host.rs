@@ -75,7 +75,8 @@ impl TextMetrics for HostMetrics {
 pub(crate) fn font_index(font: Font) -> usize {
     match font {
         Font::Normal => 0,
-        Font::Bold | Font::Heading => 1,
+        Font::Bold => 1,
+        Font::Heading => 4,
         Font::Slot(n) => usize::from(n),
     }
 }
@@ -126,8 +127,12 @@ impl Surface {
     }
 
     unsafe fn use_font(&self, a: CoreAccess<'_>, font: Font, color: [u8; 4]) -> RuntimeResult<()> {
-        let font = unsafe { root_font(a, self.root, font_index(font))? };
-        unsafe { prop(a, self.canvas, "Font", "Core.ObjectProperty", size_of::<*mut UObject>())?.cast::<*mut UObject>().write_unaligned(font) };
+        let idx = font_index(font);
+        let mut font_obj = unsafe { root_font(a, self.root, idx)? };
+        if font_obj.is_null() && idx > 1 {
+            font_obj = unsafe { root_font(a, self.root, 1)? };
+        }
+        unsafe { prop(a, self.canvas, "Font", "Core.ObjectProperty", size_of::<*mut UObject>())?.cast::<*mut UObject>().write_unaligned(font_obj) };
         unsafe { self.set_color(a, color) }
     }
 

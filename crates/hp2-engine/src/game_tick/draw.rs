@@ -87,6 +87,9 @@ pub(crate) trait DrawOps {
     unsafe fn actor_event_post_render(&self, actor: *mut c_void, canvas: *mut c_void)
         -> Result<(), Self::Error>;
     unsafe fn viewport_ui_scale(&self, viewport: *mut c_void) -> Result<f32, Self::Error>;
+    unsafe fn menu_book_is_open(&self, _console: *mut c_void) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
     unsafe fn apply_console_ui_scale(&self, viewport: *mut c_void) -> Result<(), Self::Error>;
     unsafe fn console_post_render(&self, console: *mut c_void, frame: *mut c_void)
         -> Result<(), Self::Error>;
@@ -528,6 +531,7 @@ struct ConsoleRenderState {
     size_y: f32,
     mouse_x: f32,
     mouse_y: f32,
+    stretch_active: bool,
     active: bool,
 }
 
@@ -537,6 +541,11 @@ impl ConsoleRenderState {
             return;
         }
         self.active = false;
+        #[cfg(feature = "renderer-wgpu")]
+        if self.stretch_active {
+            hp2_wgpu::set_tile_x_stretch(None);
+            self.stretch_active = false;
+        }
         unsafe {
             super::set_canvas_org_x(self.canvas, self.org_x);
             super::set_canvas_org_y(self.canvas, self.org_y);
@@ -587,6 +596,7 @@ unsafe fn console_block<O: DrawOps>(
             size_y: saved_size_y as f32,
             mouse_x: saved_mouse_x,
             mouse_y: saved_mouse_y,
+            stretch_active: false,
             active: true,
         };
 
@@ -597,13 +607,30 @@ unsafe fn console_block<O: DrawOps>(
         let offset_x = max(0.0, (saved_clip_x - ui_width) * 0.5);
         let offset_y = max(0.0, (saved_clip_y - ui_height) * 0.5);
 
+        let stretch_menu =
+            cfg!(feature = "renderer-wgpu")
+                && s.menu_book_is_open(console)?
+                && saved_clip_x > ui_width + 0.5
+                && ui_width > 0.0;
+        let mapped_mouse_x = if stretch_menu {
+            let factor = saved_clip_x / ui_width;
+            #[cfg(feature = "renderer-wgpu")]
+            {
+                hp2_wgpu::set_tile_x_stretch(Some((saved_org_x + offset_x, saved_org_x, factor)));
+                saved_state.stretch_active = true;
+            }
+            (saved_mouse_x - saved_org_x) / factor
+        } else {
+            saved_mouse_x - offset_x
+        };
+
         unsafe { super::set_canvas_org_x(canvas, saved_org_x + offset_x) };
         unsafe { super::set_canvas_org_y(canvas, saved_org_y + offset_y) };
         unsafe { super::set_canvas_clip_x(canvas, ui_width) };
         unsafe { super::set_canvas_size_x(canvas, app_round(ui_width)) };
         unsafe { super::set_canvas_size_y(canvas, app_round(ui_height)) };
         unsafe { super::set_canvas_clip_y(canvas, ui_height) };
-        unsafe { super::set_viewport_mouse(viewport, AXIS_X, saved_mouse_x - offset_x) };
+        unsafe { super::set_viewport_mouse(viewport, AXIS_X, mapped_mouse_x) };
         unsafe { super::set_viewport_mouse(viewport, AXIS_Y, saved_mouse_y - offset_y) };
         s.apply_console_ui_scale(viewport)?;
         s.console_post_render(console, frame)?;
